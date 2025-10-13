@@ -3,6 +3,7 @@ name: Build AppImage
 on:
   push:
     branches: [ main ]
+    tags: ['v*']
   workflow_dispatch: {}
   release:
     types: [created]
@@ -68,8 +69,8 @@ jobs:
           name: baConvert-AppImage
           path: '*.AppImage'
 
-      - name: Upload to release (if release event)
-        if: github.event_name == 'release'
+      - name: Create release and upload AppImage (on tag push or release)
+        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           files: '*.AppImage'
