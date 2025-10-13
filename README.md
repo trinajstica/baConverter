@@ -9,6 +9,7 @@ Requirements
 - ninja
 - libadwaita-1 (development files)
 - gtk4 (development files)
+ - ffmpeg (optional, required for actual media conversion at runtime)
 
 Build
 
