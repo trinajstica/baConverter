@@ -1,6 +1,6 @@
-# baConvert
+# baConverter
 
-Minimal GNOME libadwaita application skeleton named "baConvert".
+Minimal GNOME libadwaita application skeleton named "baConverter".
 
 Executable: bac
 
@@ -42,16 +42,16 @@ ninja -C build
 Notes
 - This is a minimal, monolithic C app using libadwaita/GTK4. Window default size is 800x600 and is resizable (responsive). Follow GNOME Human Interface Guidelines and libadwaita styles when adding UI.
 
-Why use baConvert?
+Why use baConverter?
 
-baConvert is a lightweight, straightforward desktop tool for converting multimedia files on GNOME. It targets users who want to:
+baConverter is a lightweight, straightforward desktop tool for converting multimedia files on GNOME. It targets users who want to:
 
 - quickly transcode video or audio without writing complex command lines;
 - keep or drop audio/video streams using the "copy" option to preserve original quality or to export quickly without re-encoding;
 - export files into common containers (MP4, MKV, WebM, etc.) with sensible default encoder choices;
 - integrate with the GNOME desktop (desktop entry, icons) so the tool is discoverable from the applications menu or shell search.
 
-For developers, baConvert also:
+For developers, baConverter also:
 
 - serves as a compact example of using libadwaita/GTK4 in C to build a simple GUI tool;
 - demonstrates invoking external programs (ffmpeg/ffprobe) and parsing their output to update the UI.

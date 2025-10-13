@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=baConverter
+Comment=Simple conversion helper
+Exec=bac
+Icon=baConverter
+Type=Application
+Terminal=false
+Categories=Utility;GTK;
+StartupWMClass=baConverter
+X-GNOME-UsesNotifications=true

@@ -936,10 +936,10 @@ static void on_adw_exit_dialog_response(AdwDialog *dialog, const char *response,
 static gboolean on_window_close_request(GtkWindow *window, gpointer user_data) {
     /* Build a nicer dialog with icon and wrapped text. If a conversion
      * is currently running, clarify that quitting will stop it. */
-    const char *title_text = "Quit baConvert";
+    const char *title_text = "Quit baConverter";
     const char *desc_text;
     /* Keep dialog short and simple; user requested no extra warnings about killing ffmpeg */
-    desc_text = "Do you want to quit baConvert?";
+    desc_text = "Do you want to quit baConverter?";
 
     /* Use an AdwAlertDialog (modern Adwaita dialog) with two responses. */
     if (log_buffer) gtk_text_buffer_insert_at_cursor(log_buffer, "[debug] presenting quit dialog\n", -1);
@@ -963,7 +963,7 @@ activate (GtkApplication *app)
 
     /* Create a GtkApplicationWindow tied to the application */
     window = gtk_application_window_new (app);
-    gtk_window_set_title (GTK_WINDOW (window), "baConvert");
+    gtk_window_set_title (GTK_WINDOW (window), "baConverter");
     gtk_window_set_default_size (GTK_WINDOW (window), 800, 600);
     g_signal_connect(window, "close-request", G_CALLBACK(on_window_close_request), NULL);
 
@@ -1104,7 +1104,7 @@ main (int argc, char **argv)
     for (int i = 0; formats[i] != NULL; i++)
         g_ptr_array_add(container_formats, g_strdup(formats[i]));
 
-    app = gtk_application_new ("si.generacija.baconvert", G_APPLICATION_DEFAULT_FLAGS);
+    app = gtk_application_new ("si.generacija.baconverter", G_APPLICATION_DEFAULT_FLAGS);
 
     g_signal_connect (app, "activate", G_CALLBACK (activate), NULL);
 
