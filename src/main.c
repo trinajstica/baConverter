@@ -37,6 +37,9 @@ static GPtrArray *container_formats = NULL;
 static char *current_format = NULL;
 static gboolean input_has_audio = FALSE;
 static gboolean input_has_video = FALSE;
+/* default codec strings are allocated when needed (avoid freeing literals) */
+static char *default_audio_codec = NULL;
+static char *default_video_codec = NULL;
 
 /* Helper: add codec to array if not already present */
 static void add_codec_if_missing(GPtrArray *arr, const char *codec)
@@ -47,6 +50,28 @@ static void add_codec_if_missing(GPtrArray *arr, const char *codec)
             return;
     }
     g_ptr_array_add(arr, g_strdup(codec));
+}
+
+/* Reorder codecs in-place so that entries from `priority` appear first (in order).
+ * 'priority' is a NULL-terminated array of strings. This moves matching items
+ * to the front while preserving the relative order of remaining items.
+ */
+static void reorder_codecs_by_popularity(GPtrArray *arr, const char **priority)
+{
+    if (!arr || !priority) return;
+    guint pos = 0;
+    for (int p = 0; priority[p] != NULL; p++) {
+        for (guint i = pos; i < arr->len; i++) {
+            const char *name = g_ptr_array_index(arr, i);
+            if (g_strcmp0(name, priority[p]) == 0) {
+                gpointer elt = g_ptr_array_remove_index(arr, i);
+                /* insert moves element to desired front position */
+                g_ptr_array_insert(arr, pos, elt);
+                pos++;
+                break;
+            }
+        }
+    }
 }
 
 /* Parse output of `ffmpeg -encoders` and populate audio_codecs/video_codecs. */
@@ -68,12 +93,20 @@ static void gather_ffmpeg_encoders(const char *ffmpeg_exe)
     if (!ffmpeg_exe) {
         add_codec_if_missing(audio_codecs, "aac");
         add_codec_if_missing(audio_codecs, "mp3");
+        /* Add libvorbis to the fallback list so 'ogg' / 'webm' defaults work
+         * even when ffmpeg is not present on PATH. */
+        add_codec_if_missing(audio_codecs, "libvorbis");
         add_codec_if_missing(audio_codecs, "opus");
         add_codec_if_missing(audio_codecs, "flac");
         add_codec_if_missing(video_codecs, "libx264");
         add_codec_if_missing(video_codecs, "libx265");
         add_codec_if_missing(video_codecs, "libvpx-vp9");
         add_codec_if_missing(video_codecs, "libaom-av1");
+        /* Reorder popular codecs to the top */
+        const char *audio_priority[] = {"copy", "aac", "mp3", "opus", "libvorbis", "flac", NULL};
+        const char *video_priority[] = {"copy", "libx264", "libx265", "libvpx-vp9", "libaom-av1", NULL};
+        reorder_codecs_by_popularity(audio_codecs, audio_priority);
+        reorder_codecs_by_popularity(video_codecs, video_priority);
         return;
     }
 
@@ -167,6 +200,7 @@ static const FormatDefault format_defaults[] = {
     {"webm", "libvorbis", "libvpx-vp9"},
     {"mov", "aac", "libx264"},
     {"mpeg", "mp2", "mpeg2video"},
+    {"ogg", "libvorbis", NULL},
     {"mp3", "mp3", NULL},
     {"flac", "flac", NULL},
     {"wav", "pcm_s16le", NULL},
@@ -197,6 +231,7 @@ static const char *map_probe_format_to_container(const char *probe)
     if (g_strstr_len(probe, -1, "wav")) return "wav";
     if (g_strstr_len(probe, -1, "mp3")) return "mp3";
     if (g_strstr_len(probe, -1, "flac")) return "flac";
+    if (g_strstr_len(probe, -1, "ogg")) return "ogg";
     if (g_strstr_len(probe, -1, "webm")) return "webm";
     return NULL;
 }
@@ -205,6 +240,56 @@ static const char *map_probe_format_to_container(const char *probe)
 static void set_codecs_for_format(const char *fmt)
 {
     if (!fmt) return;
+    /* If the user explicitly selected 'auto', behave like the Reset buttons
+     * for both audio and video: apply detected/default selections so the UI
+     * reflects what was detected from the input file. This makes selecting
+     * Auto equivalent to resetting codecs to detected defaults. */
+    if (g_strcmp0(fmt, "auto") == 0) {
+        /* Audio reset logic */
+        if (audio_codecs) {
+            if (!input_has_audio) {
+                gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), FALSE);
+                gtk_drop_down_set_selected(GTK_DROP_DOWN(audio_combo), 0);
+                gtk_widget_set_sensitive(audio_combo, TRUE);
+                gtk_widget_set_sensitive(reset_audio, !gtk_check_button_get_active(GTK_CHECK_BUTTON(copy_audio_check)));
+            } else if (!default_audio_codec || g_strcmp0(default_audio_codec, "copy") == 0) {
+                gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), TRUE);
+                gtk_widget_set_sensitive(audio_combo, FALSE);
+                /* 'copy' is at index 1 (leading 'No audio' at 0) */
+                gtk_drop_down_set_selected(GTK_DROP_DOWN(audio_combo), 1);
+                gtk_widget_set_sensitive(reset_audio, FALSE);
+            } else {
+                gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), FALSE);
+                gtk_widget_set_sensitive(audio_combo, TRUE);
+                int aidx = find_best_encoder_in_array(audio_codecs, default_audio_codec, audio_encoder_map);
+                gtk_drop_down_set_selected(GTK_DROP_DOWN(audio_combo), aidx + 1);
+                gtk_widget_set_sensitive(reset_audio, TRUE);
+            }
+        }
+
+        /* Video reset logic */
+        if (video_codecs) {
+            if (!input_has_video) {
+                gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), FALSE);
+                gtk_drop_down_set_selected(GTK_DROP_DOWN(video_combo), 0);
+                gtk_widget_set_sensitive(video_combo, TRUE);
+                gtk_widget_set_sensitive(reset_video, !gtk_check_button_get_active(GTK_CHECK_BUTTON(copy_video_check)));
+            } else if (!default_video_codec || g_strcmp0(default_video_codec, "copy") == 0) {
+                gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), TRUE);
+                gtk_widget_set_sensitive(video_combo, FALSE);
+                /* 'copy' is at index 1 (leading 'No video' at 0) */
+                gtk_drop_down_set_selected(GTK_DROP_DOWN(video_combo), 1);
+                gtk_widget_set_sensitive(reset_video, FALSE);
+            } else {
+                gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), FALSE);
+                gtk_widget_set_sensitive(video_combo, TRUE);
+                int vidx = find_best_encoder_in_array(video_codecs, default_video_codec, video_encoder_map);
+                gtk_drop_down_set_selected(GTK_DROP_DOWN(video_combo), vidx + 1);
+                gtk_widget_set_sensitive(reset_video, TRUE);
+            }
+        }
+        return;
+    }
     const char *want_audio = NULL;
     const char *want_video = NULL;
     for (int i = 0; format_defaults[i].format != NULL; i++) {
@@ -247,6 +332,7 @@ static const char *format_to_extension(const char *fmt)
     if (g_strcmp0(fmt, "mp3") == 0) return ".mp3";
     if (g_strcmp0(fmt, "flac") == 0) return ".flac";
     if (g_strcmp0(fmt, "wav") == 0) return ".wav";
+    if (g_strcmp0(fmt, "ogg") == 0) return ".ogg";
     return NULL;
 }
 
@@ -288,11 +374,19 @@ static void on_format_combo_changed_generic(GtkDropDown *combo, gpointer user_da
 {
     gchar *sel = drop_down_get_active_text(GTK_WIDGET(combo), format_model);
     if (!sel) return;
-    if (copy_audio_check && copy_video_check &&
-        gtk_check_button_get_active(GTK_CHECK_BUTTON(copy_audio_check)) &&
-        gtk_check_button_get_active(GTK_CHECK_BUTTON(copy_video_check))) {
-        gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), FALSE);
-        gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), FALSE);
+    /* If the user selects 'auto', leave copy checkboxes alone (auto-exempt).
+     * For any other explicit format selection, clear both Copy checkboxes so
+     * the user must explicitly choose codecs. */
+    if (g_strcmp0(sel, "auto") != 0 && copy_audio_check && copy_video_check) {
+        if (gtk_check_button_get_active(GTK_CHECK_BUTTON(copy_audio_check)))
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), FALSE);
+        if (gtk_check_button_get_active(GTK_CHECK_BUTTON(copy_video_check)))
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), FALSE);
+        /* Ensure codec combos are enabled so user can pick encoders */
+        gtk_widget_set_sensitive(audio_combo, TRUE);
+        gtk_widget_set_sensitive(video_combo, TRUE);
+        gtk_widget_set_sensitive(reset_audio, TRUE);
+        gtk_widget_set_sensitive(reset_video, TRUE);
     }
     g_free(current_format);
     current_format = g_strdup(sel);
@@ -348,11 +442,6 @@ static gint find_best_encoder_in_array(GPtrArray *arr, const char *codec, const 
     g_free(codec_l);
     return 0;
 }
-
-/* Default codecs */
-/* default codec strings are allocated when needed (avoid freeing literals) */
-static char *default_audio_codec = NULL;
-static char *default_video_codec = NULL;
 
 /* Helper: show an alert dialog (non-blocking) */
 static char *ffmpeg_path = NULL;
@@ -536,7 +625,49 @@ static void on_file_dialog_open_finish(GObject *source_object, GAsyncResult *res
         gtk_drop_down_set_selected(GTK_DROP_DOWN(format_combo_audio), 0);
     }
     update_output_label();
+    /* Enable UI controls now that an input was selected. */
     gtk_widget_set_sensitive(start_button, TRUE);
+    /* Enable copy checkboxes so user can toggle copy behavior */
+    gtk_widget_set_sensitive(copy_audio_check, TRUE);
+    gtk_widget_set_sensitive(copy_video_check, TRUE);
+    /* Format dropdown should be enabled */
+    gtk_widget_set_sensitive(format_combo_audio, TRUE);
+    /* Enable or disable audio controls based on detection and copy checkbox */
+    if (input_has_audio) {
+        /* If default is 'copy', set the checkbox active and disable combo */
+        if (default_audio_codec && g_strcmp0(default_audio_codec, "copy") == 0) {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), TRUE);
+            gtk_widget_set_sensitive(audio_combo, FALSE);
+            gtk_widget_set_sensitive(reset_audio, FALSE);
+        } else {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), FALSE);
+            gtk_widget_set_sensitive(audio_combo, TRUE);
+            gtk_widget_set_sensitive(reset_audio, TRUE);
+        }
+    } else {
+        /* No audio: leave Copy unchecked and allow selection of 'No audio' */
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), FALSE);
+        gtk_widget_set_sensitive(audio_combo, TRUE);
+        gtk_widget_set_sensitive(reset_audio, TRUE);
+    }
+    /* Enable or disable video controls based on detection and copy checkbox */
+    if (input_has_video) {
+        if (default_video_codec && g_strcmp0(default_video_codec, "copy") == 0) {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), TRUE);
+            gtk_widget_set_sensitive(video_combo, FALSE);
+            gtk_widget_set_sensitive(reset_video, FALSE);
+        } else {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), FALSE);
+            gtk_widget_set_sensitive(video_combo, TRUE);
+            gtk_widget_set_sensitive(reset_video, TRUE);
+        }
+    } else {
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), FALSE);
+        gtk_widget_set_sensitive(video_combo, TRUE);
+        gtk_widget_set_sensitive(reset_video, TRUE);
+    }
+    /* Ensure Start/Stop reflect running state */
+    gtk_widget_set_sensitive(stop_button, FALSE);
     g_object_unref(file);
     g_object_unref(dialog);
 }
@@ -576,10 +707,28 @@ static void on_copy_video_toggled(GtkCheckButton *check, gpointer user_data) {
 
 /* Combo changes */
 static void on_audio_combo_changed(GtkComboBox *combo, gpointer user_data) {
+    gchar *sel = drop_down_get_active_text(GTK_WIDGET(combo), audio_model);
+    if (sel) {
+        if (g_strcmp0(sel, "copy") == 0 || g_strcmp0(sel, "Copy") == 0) {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), TRUE);
+        } else {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), FALSE);
+        }
+        g_free(sel);
+    }
     update_output_label();
 }
 
 static void on_video_combo_changed(GtkComboBox *combo, gpointer user_data) {
+    gchar *sel = drop_down_get_active_text(GTK_WIDGET(combo), video_model);
+    if (sel) {
+        if (g_strcmp0(sel, "copy") == 0 || g_strcmp0(sel, "Copy") == 0) {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), TRUE);
+        } else {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), FALSE);
+        }
+        g_free(sel);
+    }
     update_output_label();
 }
 
@@ -995,25 +1144,29 @@ activate (GtkApplication *app)
     audio_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
     copy_audio_check = gtk_check_button_new_with_label ("Copy audio");
     g_signal_connect(copy_audio_check, "toggled", G_CALLBACK(on_copy_audio_toggled), NULL);
+    /* Initially disabled until an input file is selected */
+    gtk_widget_set_sensitive(copy_audio_check, FALSE);
     gtk_box_append (GTK_BOX (audio_box), copy_audio_check);
     audio_combo = gtk_drop_down_new(NULL, 0);
-    /* Initially enabled; will be disabled if 'Copy audio' is checked */
-    gtk_widget_set_sensitive(audio_combo, TRUE);
+    /* Initially disabled; will be enabled after an input file is selected */
+    gtk_widget_set_sensitive(audio_combo, FALSE);
     /* Fixed width so both combos have equal length */
     gtk_widget_set_size_request(audio_combo, 250, -1);
     g_signal_connect(audio_combo, "notify::selected", G_CALLBACK(on_audio_combo_changed), NULL);
     gtk_box_append (GTK_BOX (audio_box), audio_combo);
     reset_audio = gtk_button_new_with_label ("Reset");
     g_signal_connect(reset_audio, "clicked", G_CALLBACK(on_reset_audio_clicked), NULL);
-    /* Disable reset when copy is active */
-    gtk_widget_set_sensitive(reset_audio, !gtk_check_button_get_active(GTK_CHECK_BUTTON(copy_audio_check)));
+    /* Initially disabled; will be enabled/disabled after input selection */
+    gtk_widget_set_sensitive(reset_audio, FALSE);
     gtk_box_append (GTK_BOX (audio_box), reset_audio);
     /* Separator and format combobox on the right */
     GtkWidget *sep_label_a = gtk_label_new("|");
     gtk_widget_set_margin_start(sep_label_a, 6);
     gtk_box_append(GTK_BOX(audio_box), sep_label_a);
     format_combo_audio = gtk_drop_down_new(NULL, 0);
+    /* Initially disabled until an input file is selected */
     gtk_widget_set_size_request(format_combo_audio, 150, -1);
+    gtk_widget_set_sensitive(format_combo_audio, FALSE);
     g_signal_connect(format_combo_audio, "notify::selected", G_CALLBACK(on_format_combo_changed_generic), NULL);
     gtk_box_append(GTK_BOX(audio_box), format_combo_audio);
     gtk_box_append (GTK_BOX (box), audio_box);
@@ -1022,18 +1175,20 @@ activate (GtkApplication *app)
     video_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
     copy_video_check = gtk_check_button_new_with_label ("Copy video");
     g_signal_connect(copy_video_check, "toggled", G_CALLBACK(on_copy_video_toggled), NULL);
+    /* Initially disabled until an input file is selected */
+    gtk_widget_set_sensitive(copy_video_check, FALSE);
     gtk_box_append (GTK_BOX (video_box), copy_video_check);
     video_combo = gtk_drop_down_new(NULL, 0);
-    /* Initially enabled; will be disabled if 'Copy video' is checked */
-    gtk_widget_set_sensitive(video_combo, TRUE);
+    /* Initially disabled; will be enabled after an input file is selected */
+    gtk_widget_set_sensitive(video_combo, FALSE);
     /* Fixed width so both combos have equal length */
     gtk_widget_set_size_request(video_combo, 250, -1);
     g_signal_connect(video_combo, "notify::selected", G_CALLBACK(on_video_combo_changed), NULL);
     gtk_box_append (GTK_BOX (video_box), video_combo);
     reset_video = gtk_button_new_with_label ("Reset");
     g_signal_connect(reset_video, "clicked", G_CALLBACK(on_reset_video_clicked), NULL);
-    /* Disable reset when copy is active */
-    gtk_widget_set_sensitive(reset_video, !gtk_check_button_get_active(GTK_CHECK_BUTTON(copy_video_check)));
+    /* Initially disabled; will be enabled/disabled after input selection */
+    gtk_widget_set_sensitive(reset_video, FALSE);
     gtk_box_append (GTK_BOX (video_box), reset_video);
     /* (format combobox moved to the audio row; no separate format on video row) */
     gtk_box_append (GTK_BOX (box), video_box);
@@ -1041,10 +1196,12 @@ activate (GtkApplication *app)
     /* Start/Stop buttons */
     GtkWidget *button_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
     start_button = gtk_button_new_with_label ("Start");
+    /* Start disabled until an input file is selected */
     gtk_widget_set_sensitive(start_button, FALSE);
     g_signal_connect(start_button, "clicked", G_CALLBACK(on_start_clicked), NULL);
     gtk_box_append (GTK_BOX (button_box), start_button);
     stop_button = gtk_button_new_with_label ("Stop");
+    /* Stop stays disabled until a conversion is running */
     gtk_widget_set_sensitive(stop_button, FALSE);
     g_signal_connect(stop_button, "clicked", G_CALLBACK(on_stop_clicked), NULL);
     gtk_box_append (GTK_BOX (button_box), stop_button);
@@ -1073,6 +1230,22 @@ activate (GtkApplication *app)
         gtk_drop_down_set_selected(GTK_DROP_DOWN(format_combo_audio), 0);
     }
 
+    /* Ensure every interactive widget is disabled on startup except the Choose button.
+     * The Choose button (choose_button) remains enabled so the user can select an input file.
+     */
+    gtk_widget_set_sensitive(copy_audio_check, FALSE);
+    gtk_widget_set_sensitive(audio_combo, FALSE);
+    gtk_widget_set_sensitive(reset_audio, FALSE);
+    gtk_widget_set_sensitive(format_combo_audio, FALSE);
+    gtk_widget_set_sensitive(copy_video_check, FALSE);
+    gtk_widget_set_sensitive(video_combo, FALSE);
+    gtk_widget_set_sensitive(reset_video, FALSE);
+    gtk_widget_set_sensitive(start_button, FALSE);
+    gtk_widget_set_sensitive(stop_button, FALSE);
+    /* Make log view non-interactive until an input is chosen */
+    gtk_widget_set_sensitive(log_text_view, FALSE);
+    if (scrolled) gtk_widget_set_sensitive(scrolled, FALSE);
+
     /* Present the window */
     gtk_window_present (GTK_WINDOW (window));
 }
@@ -1100,7 +1273,7 @@ main (int argc, char **argv)
     /* Known container/format list (simple set). Kept separate so UI can
      * offer common choices regardless of ffmpeg availability. */
     container_formats = g_ptr_array_new_with_free_func(g_free);
-    const char *formats[] = {"auto", "avi", "mp4", "mkv", "webm", "mov", "mpeg", "mp3", "flac", "wav", NULL};
+    const char *formats[] = {"auto", "avi", "mp4", "mkv", "webm", "mov", "mpeg", "mp3", "flac", "wav", "ogg", NULL};
     for (int i = 0; formats[i] != NULL; i++)
         g_ptr_array_add(container_formats, g_strdup(formats[i]));
 
