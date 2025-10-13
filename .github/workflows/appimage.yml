@@ -1,0 +1,77 @@
+name: Build AppImage
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+  release:
+    types: [created]
+
+jobs:
+  build-appimage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential meson ninja-build libadwaita-1-dev libgtk-4-dev libjson-glib-dev ffmpeg wget
+
+      - name: Configure and build
+        run: |
+          meson setup --reconfigure build
+          ninja -C build
+
+      - name: Prepare AppDir
+        run: |
+          set -eux
+          APPDIR=$GITHUB_WORKSPACE/AppDir
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR"/usr/bin
+          mkdir -p "$APPDIR"/usr/share/applications
+          mkdir -p "$APPDIR"/usr/share/icons/hicolor/128x128/apps
+          mkdir -p "$APPDIR"/usr/share/icons/hicolor/scalable/apps
+
+          # copy binary
+          cp build/bac "$APPDIR"/usr/bin/
+
+          # copy desktop file and ensure Exec refers to 'bac'
+          if [ -f data/si.generacija.baconvert.desktop ]; then
+            sed 's|^Exec=.*|Exec=bac|' data/si.generacija.baconvert.desktop > "$APPDIR"/usr/share/applications/baConvert.desktop
+          fi
+
+          # copy icons if present
+          if [ -f data/icons/hicolor/scalable/apps/baConvert.svg ]; then
+            cp data/icons/hicolor/scalable/apps/baConvert.svg "$APPDIR"/usr/share/icons/hicolor/scalable/apps/ || true
+          fi
+          if [ -f data/icons/hicolor/128x128/apps/baConvert.png ]; then
+            cp data/icons/hicolor/128x128/apps/baConvert.png "$APPDIR"/usr/share/icons/hicolor/128x128/apps/ || true
+          fi
+
+          chmod -R a+r "$APPDIR"
+          chmod +x "$APPDIR"/usr/bin/bac
+
+      - name: Download appimagetool
+        run: |
+          wget -nv -O appimagetool https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+      - name: Build AppImage
+        run: |
+          ./appimagetool AppDir || true
+          ls -lh *.AppImage || true
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: baConvert-AppImage
+          path: '*.AppImage'
+
+      - name: Upload to release (if release event)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: '*.AppImage'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
