@@ -1,0 +1,26 @@
+# Ignore build output
+/build/
+
+# Meson/Ninja generated files
+/build/**
+
+# Compile database (generated)
+/compile_commands.json
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python
+venv/
+__pycache__/
+
+# Logs and temporary files
+*.log
+*.tmp
