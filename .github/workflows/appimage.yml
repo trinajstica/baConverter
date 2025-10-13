@@ -21,8 +21,17 @@ jobs:
 
       - name: Configure and build
         run: |
+          set -eux
           meson setup --reconfigure build
-          ninja -C build
+          ninja -C build || (if [ -f build/meson-logs/meson-log.txt ]; then cat build/meson-logs/meson-log.txt; fi; false)
+
+      - name: Check that bac was built
+        run: |
+          if [ ! -x build/bac ]; then
+            echo "ERROR: build/bac not found or not executable!" >&2
+            ls -la build || true
+            exit 1
+          fi
 
       - name: Prepare AppDir
         run: |
@@ -34,8 +43,13 @@ jobs:
           mkdir -p "$APPDIR"/usr/share/icons/hicolor/128x128/apps
           mkdir -p "$APPDIR"/usr/share/icons/hicolor/scalable/apps
 
-          # copy binary
-          cp build/bac "$APPDIR"/usr/bin/
+          # copy binary only if present
+          if [ -x build/bac ]; then
+            cp build/bac "$APPDIR"/usr/bin/
+          else
+            echo "ERROR: build/bac missing in Prepare AppDir step!" >&2
+            exit 1
+          fi
 
           # copy desktop file and ensure Exec refers to 'bac'
           if [ -f data/si.generacija.baconvert.desktop ]; then
