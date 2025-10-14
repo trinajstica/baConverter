@@ -82,6 +82,25 @@ sudo dnf install -y meson ninja-build @development-tools libadwaita-devel gtk4-d
 sudo pacman -Syu meson ninja base-devel libadwaita gtk4 json-glib ffmpeg
 ```
 
+- Solus (example):
+
+```sh
+# refresh local repo metadata first
+sudo eopkg update-repo
+# then install development and runtime packages
+sudo eopkg install -y meson ninja gcc libjson-glib-devel ffmpeg libgtk-4-devel libadwaita-devel
+```
+
+Notes for Solus:
+- `pkg-config` is usually available on a developer system; if it's missing, install the relevant package from the repos.
+- If the Meson in Solus repos is older than the project's `meson_version` requirement, install Meson via `pipx` or `pip3 --user` to get a newer version:
+
+```sh
+pipx install meson
+# or
+pip3 install --user meson
+```
+
 Build, install and uninstall
 
 ```sh

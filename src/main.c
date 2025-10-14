@@ -41,6 +41,58 @@ static gboolean input_has_video = FALSE;
 static char *default_audio_codec = NULL;
 static char *default_video_codec = NULL;
 
+/* Batch processing state */
+static GPtrArray *batch_files = NULL; /* array of gchar* paths */
+static gboolean batch_running = FALSE;
+static guint batch_index = 0;
+/* Batch dialog widgets (created on demand) */
+static GtkWidget *batch_dialog = NULL;
+static GtkWidget *batch_listbox = NULL;
+static GtkWidget *batch_start_button = NULL;
+static GtkWidget *batch_add_folder_button = NULL;
+static GtkWidget *batch_add_files_button = NULL;
+static GtkWidget *batch_remove_button = NULL;
+static GtkWidget *batch_stop_button = NULL;
+
+/* Forward declarations for batch functions */
+static void open_batch_dialog(GtkWindow *parent);
+static void batch_add_folder_clicked(GtkButton *button, gpointer user_data);
+static void batch_add_files_clicked(GtkButton *button, gpointer user_data);
+static void batch_remove_selected_clicked(GtkButton *button, gpointer user_data);
+static void batch_start_clicked_cb(GtkButton *button, gpointer user_data);
+static void batch_stop_clicked_cb(GtkButton *button, gpointer user_data);
+static void process_next_in_batch(void);
+static gboolean continue_batch_idle(gpointer user_data);
+static void batch_row_selected_cb(GtkListBox *box, GtkListBoxRow *row, gpointer user_data);
+static void batch_add_folder_native_response(GtkNativeDialog *native, gint response, gpointer user_data);
+static void batch_add_files_native_response(GtkNativeDialog *native, gint response, gpointer user_data);
+static void add_single_file_to_batch(GFile *file);
+static gboolean batch_dialog_close_request_cb(GtkWindow *window, gpointer user_data);
+static gboolean batch_has_path(const char *path);
+
+static gboolean is_batch_dialog_open(void)
+{
+    return batch_dialog != NULL;
+}
+
+static gboolean can_enable_start_button(void)
+{
+    if (!input_file)
+        return FALSE;
+    if (ffmpeg_pid > 0)
+        return FALSE;
+    if (is_batch_dialog_open())
+        return FALSE;
+    return TRUE;
+}
+
+static void update_start_button_state(void)
+{
+    if (!start_button)
+        return;
+    gtk_widget_set_sensitive(start_button, can_enable_start_button());
+}
+
 /* Helper: add codec to array if not already present */
 static void add_codec_if_missing(GPtrArray *arr, const char *codec)
 {
@@ -459,6 +511,7 @@ static gboolean ffmpeg_stdout_cb(GIOChannel *source, GIOCondition condition, gpo
 static gboolean ffmpeg_stderr_cb(GIOChannel *source, GIOCondition condition, gpointer user_data);
 static void ffmpeg_child_watch_cb(GPid pid, gint status, gpointer user_data);
 static gboolean enable_ui_after_child(gpointer user_data);
+static void on_stop_clicked(GtkButton *button, gpointer user_data);
 /* (prototype already declared above) */
 
 /* Detect default codecs from input file */
@@ -626,7 +679,7 @@ static void on_file_dialog_open_finish(GObject *source_object, GAsyncResult *res
     }
     update_output_label();
     /* Enable UI controls now that an input was selected. */
-    gtk_widget_set_sensitive(start_button, TRUE);
+    update_start_button_state();
     /* Enable copy checkboxes so user can toggle copy behavior */
     gtk_widget_set_sensitive(copy_audio_check, TRUE);
     gtk_widget_set_sensitive(copy_video_check, TRUE);
@@ -866,7 +919,7 @@ static void on_start_clicked(GtkButton *button, gpointer user_data) {
     /* show alert to user (no parent available here) */
     show_alert(NULL, "ffmpeg error", msg);
     /* Restore UI since spawn failed */
-    gtk_widget_set_sensitive(start_button, TRUE);
+    update_start_button_state();
     gtk_widget_set_sensitive(stop_button, FALSE);
         if (error) g_error_free(error);
         g_free(audio_dup);
@@ -902,7 +955,7 @@ static void on_start_clicked(GtkButton *button, gpointer user_data) {
 
 /* Child and IO callbacks */
 static gboolean enable_ui_after_child(gpointer user_data) {
-    gtk_widget_set_sensitive(start_button, TRUE);
+    update_start_button_state();
     gtk_widget_set_sensitive(stop_button, FALSE);
     /* Re-enable codec combos unless their 'Copy' checkboxes are active */
     if (!gtk_check_button_get_active(GTK_CHECK_BUTTON(copy_audio_check)))
@@ -937,6 +990,488 @@ static void ffmpeg_child_watch_cb(GPid pid, gint status, gpointer user_data) {
     g_spawn_close_pid(pid);
     g_idle_add(enable_ui_after_child, NULL);
     if (ffmpeg_pid == pid) ffmpeg_pid = 0;
+    /* If batch mode is running, schedule continuation to next file */
+    if (batch_running) {
+        /* schedule on main loop to avoid reentrancy in child watch */
+        g_idle_add(continue_batch_idle, NULL);
+    }
+}
+
+/* Continue batch processing on idle (called after a conversion finishes) */
+static gboolean continue_batch_idle(gpointer user_data)
+{
+    process_next_in_batch();
+    return G_SOURCE_REMOVE;
+}
+
+/* Collect files recursively from a folder GFile and append to batch_files and listbox */
+static void collect_files_from_folder(GFile *folder)
+{
+    if (!folder) return;
+    GError *err = NULL;
+    /* Request content-type so we can filter non-media files */
+    const char *attrs = G_FILE_ATTRIBUTE_STANDARD_NAME "," G_FILE_ATTRIBUTE_STANDARD_TYPE ",standard::content-type";
+    GFileEnumerator *enumerator = g_file_enumerate_children(folder, attrs, G_FILE_QUERY_INFO_NONE, NULL, &err);
+    if (!enumerator) {
+        if (err) g_error_free(err);
+        return;
+    }
+    GFileInfo *info;
+    while ((info = g_file_enumerator_next_file(enumerator, NULL, &err)) != NULL) {
+        const char *name = g_file_info_get_name(info);
+        GFile *child = g_file_get_child(folder, name);
+        GFileType type = g_file_info_get_file_type(info);
+        if (type == G_FILE_TYPE_DIRECTORY) {
+            collect_files_from_folder(child);
+        } else if (type == G_FILE_TYPE_REGULAR) {
+            /* check content-type first; if missing, fall back to extension matching */
+            const char *ctype = g_file_info_get_content_type(info);
+            gboolean is_media = FALSE;
+            if (ctype) {
+                if (g_str_has_prefix(ctype, "audio/") || g_str_has_prefix(ctype, "video/"))
+                    is_media = TRUE;
+            }
+            if (!is_media) {
+                /* fallback: check extension */
+                char *path = g_file_get_path(child);
+                if (path) {
+                    const char *ext = strrchr(path, '.');
+                    if (ext) {
+                        gchar *ext_l = g_utf8_strdown(ext + 1, -1);
+                        const char *good_exts[] = {"mp4","mkv","webm","avi","mov","mpeg","mpg","mp3","flac","wav","ogg","aac","m4a","opus","m4v","webm","m2ts", NULL};
+                        for (int i = 0; good_exts[i] != NULL; i++) {
+                            if (g_strcmp0(ext_l, good_exts[i]) == 0) { is_media = TRUE; break; }
+                        }
+                        g_free(ext_l);
+                    }
+                    g_free(path);
+                }
+            }
+            if (is_media) {
+                char *path = g_file_get_path(child);
+                if (path) {
+                    if (!batch_has_path(path)) {
+                        if (!batch_files) batch_files = g_ptr_array_new_with_free_func(g_free);
+                        g_ptr_array_add(batch_files, g_strdup(path));
+                        if (batch_listbox) {
+                            GtkWidget *row = gtk_label_new(path);
+                            /* left align and ellipsize start so filename at end stays visible */
+                            gtk_label_set_xalign(GTK_LABEL(row), 0.0);
+                            gtk_label_set_ellipsize(GTK_LABEL(row), PANGO_ELLIPSIZE_START);
+                            /* show tooltip with full path */
+                            gtk_widget_set_tooltip_text(row, path);
+                            gtk_list_box_insert(GTK_LIST_BOX(batch_listbox), row, -1);
+                                gtk_widget_set_visible(row, TRUE);
+                                /* Select the first row in the list so the first item is applied */
+                                {
+                                    GtkListBoxRow *to_select = gtk_list_box_get_row_at_index(GTK_LIST_BOX(batch_listbox), 0);
+                                    if (to_select) gtk_list_box_select_row(GTK_LIST_BOX(batch_listbox), to_select);
+                                }
+                        }
+                    }
+                    g_free(path);
+                }
+            }
+        }
+        g_object_unref(child);
+        g_object_unref(info);
+    }
+    if (err) g_error_free(err);
+    g_object_unref(enumerator);
+}
+
+static void batch_add_folder_clicked(GtkButton *button, gpointer user_data)
+{
+    GtkWindow *parent = GTK_WINDOW(user_data);
+    /* Use native file chooser in folder-selection mode */
+    GtkFileChooserNative *native = gtk_file_chooser_native_new("Select folder to add", parent, GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER, "Add", "Cancel");
+    /* Connect response handler */
+    g_signal_connect(native, "response", G_CALLBACK(batch_add_folder_native_response), native);
+    gtk_native_dialog_show(GTK_NATIVE_DIALOG(native));
+}
+
+static void batch_add_folder_native_response(GtkNativeDialog *native, gint response, gpointer user_data)
+{
+    GtkFileChooserNative *chooser = GTK_FILE_CHOOSER_NATIVE(native);
+    if (response == GTK_RESPONSE_ACCEPT) {
+        GFile *f = gtk_file_chooser_get_file(GTK_FILE_CHOOSER(chooser));
+        if (f) {
+            collect_files_from_folder(f);
+            g_object_unref(f);
+        }
+    }
+    /* destroy the dialog */
+    gtk_native_dialog_destroy(native);
+}
+
+static void batch_remove_selected_clicked(GtkButton *button, gpointer user_data)
+{
+    if (!batch_listbox || !batch_files) return;
+    GList *selected = gtk_list_box_get_selected_rows(GTK_LIST_BOX(batch_listbox));
+    if (!selected) return;
+    gint min_index = -1;
+    /* find minimal index among selected rows via gtk_list_box_row_get_index */
+    for (GList *l = selected; l; l = l->next) {
+        GtkListBoxRow *sel_row = GTK_LIST_BOX_ROW(l->data);
+        gint idx = gtk_list_box_row_get_index(sel_row);
+        if (idx >= 0 && (min_index == -1 || idx < min_index)) min_index = idx;
+    }
+    /* Remove selected rows and corresponding paths */
+    for (GList *l = selected; l; l = l->next) {
+        GtkListBoxRow *sel_row = GTK_LIST_BOX_ROW(l->data);
+        GtkWidget *child = gtk_list_box_row_get_child(sel_row);
+        const char *text = NULL;
+        if (child && GTK_IS_LABEL(child)) text = gtk_label_get_text(GTK_LABEL(child));
+        if (text) {
+            for (guint i = 0; i < batch_files->len; i++) {
+                char *p = g_ptr_array_index(batch_files, i);
+                if (g_strcmp0(p, text) == 0) {
+                    g_ptr_array_remove_index(batch_files, i);
+                    break;
+                }
+            }
+        }
+        gtk_list_box_remove(GTK_LIST_BOX(batch_listbox), GTK_WIDGET(sel_row));
+    }
+    /* After removals, select the next appropriate row: try to select the row at
+     * min_index; if it doesn't exist (past end), try previous indices down to 0. */
+    if (min_index >= 0) {
+        for (gint sel_index = min_index; sel_index >= 0; sel_index--) {
+            GtkListBoxRow *to_select = gtk_list_box_get_row_at_index(GTK_LIST_BOX(batch_listbox), sel_index);
+            if (to_select) {
+                gtk_list_box_select_row(GTK_LIST_BOX(batch_listbox), to_select);
+                break;
+            }
+        }
+    }
+    g_list_free(selected);
+}
+
+static void batch_start_clicked_cb(GtkButton *button, gpointer user_data)
+{
+    if (!batch_files || batch_files->len == 0) return;
+    batch_running = TRUE;
+    batch_index = 0;
+    /* disable add/remove while running */
+    if (batch_add_folder_button) gtk_widget_set_sensitive(batch_add_folder_button, FALSE);
+    if (batch_add_files_button) gtk_widget_set_sensitive(batch_add_files_button, FALSE);
+    if (batch_remove_button) gtk_widget_set_sensitive(batch_remove_button, FALSE);
+    if (batch_start_button) gtk_widget_set_sensitive(batch_start_button, FALSE);
+    if (batch_stop_button) gtk_widget_set_sensitive(batch_stop_button, TRUE);
+    /* disable listbox so user can't change selection during batch */
+    if (batch_listbox) gtk_widget_set_sensitive(batch_listbox, FALSE);
+    process_next_in_batch();
+}
+
+static void batch_stop_clicked_cb(GtkButton *button, gpointer user_data)
+{
+    batch_running = FALSE;
+    /* Re-enable controls */
+    if (batch_add_folder_button) gtk_widget_set_sensitive(batch_add_folder_button, TRUE);
+    if (batch_add_files_button) gtk_widget_set_sensitive(batch_add_files_button, TRUE);
+    if (batch_remove_button) gtk_widget_set_sensitive(batch_remove_button, TRUE);
+    if (batch_start_button) gtk_widget_set_sensitive(batch_start_button, TRUE);
+    if (batch_stop_button) gtk_widget_set_sensitive(batch_stop_button, FALSE);
+    if (batch_listbox) gtk_widget_set_sensitive(batch_listbox, TRUE);
+    /* Also stop any running ffmpeg process */
+    on_stop_clicked(NULL, NULL);
+}
+
+/* Start processing next file in batch (if any). This will set input_file/output_file and
+ * trigger the normal on_start_clicked logic. It will skip autodetection (so do not call
+ * detect_defaults) as requested and reuse current UI settings. */
+static void process_next_in_batch(void)
+{
+    if (!batch_running) return;
+    if (!batch_files || batch_index >= batch_files->len) {
+        /* finished */
+        batch_running = FALSE;
+        if (batch_add_folder_button) gtk_widget_set_sensitive(batch_add_folder_button, TRUE);
+        if (batch_add_files_button) gtk_widget_set_sensitive(batch_add_files_button, TRUE);
+        if (batch_remove_button) gtk_widget_set_sensitive(batch_remove_button, TRUE);
+        if (batch_start_button) gtk_widget_set_sensitive(batch_start_button, TRUE);
+        if (batch_stop_button) gtk_widget_set_sensitive(batch_stop_button, FALSE);
+        if (batch_listbox) gtk_widget_set_sensitive(batch_listbox, TRUE);
+        gtk_text_buffer_insert_at_cursor(log_buffer, "Batch finished.\n", -1);
+        return;
+    }
+    /* Set input_file to next path, but DO NOT call detect_defaults (skip autodetection) */
+    char *next = g_strdup(g_ptr_array_index(batch_files, batch_index));
+    g_free(input_file);
+    input_file = next;
+    gtk_label_set_text(GTK_LABEL(input_label), input_file);
+    /* Update output_file using current format selection */
+    update_output_label();
+    /* Start conversion using existing UI settings */
+    /* Reuse on_start_clicked but it's tied to button; call directly */
+    on_start_clicked(GTK_BUTTON(start_button), NULL);
+    /* increment index for next time (we continue after child exits) */
+    batch_index++;
+}
+
+/* Open batch dialog: simple window with list and controls */
+static void open_batch_dialog(GtkWindow *parent)
+{
+    if (start_button)
+        gtk_widget_set_sensitive(start_button, FALSE);
+    if (batch_dialog) {
+        gtk_window_present(GTK_WINDOW(batch_dialog));
+        return;
+    }
+    batch_dialog = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(batch_dialog), "Batch processing");
+    gtk_window_set_default_size(GTK_WINDOW(batch_dialog), 600, 400);
+    /* When the dialog/window is closed by the user, clear the global widget
+     * pointers so open_batch_dialog() can recreate the dialog later. */
+    g_signal_connect(batch_dialog, "close-request", G_CALLBACK(batch_dialog_close_request_cb), NULL);
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_top(vbox, 8);
+    gtk_widget_set_margin_bottom(vbox, 8);
+    gtk_widget_set_margin_start(vbox, 8);
+    gtk_widget_set_margin_end(vbox, 8);
+    batch_listbox = gtk_list_box_new();
+    g_signal_connect(batch_listbox, "row-selected", G_CALLBACK(batch_row_selected_cb), NULL);
+    gtk_widget_set_vexpand(batch_listbox, TRUE);
+    gtk_box_append(GTK_BOX(vbox), batch_listbox);
+    GtkWidget *h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    batch_add_folder_button = gtk_button_new_with_label("Add folder");
+    g_signal_connect(batch_add_folder_button, "clicked", G_CALLBACK(batch_add_folder_clicked), batch_dialog);
+    gtk_box_append(GTK_BOX(h), batch_add_folder_button);
+    batch_add_files_button = gtk_button_new_with_label("Add file(s)");
+    g_signal_connect(batch_add_files_button, "clicked", G_CALLBACK(batch_add_files_clicked), batch_dialog);
+    gtk_box_append(GTK_BOX(h), batch_add_files_button);
+    batch_remove_button = gtk_button_new_with_label("Remove selected");
+    g_signal_connect(batch_remove_button, "clicked", G_CALLBACK(batch_remove_selected_clicked), NULL);
+    gtk_box_append(GTK_BOX(h), batch_remove_button);
+    batch_start_button = gtk_button_new_with_label("Start batch");
+    g_signal_connect(batch_start_button, "clicked", G_CALLBACK(batch_start_clicked_cb), NULL);
+    gtk_box_append(GTK_BOX(h), batch_start_button);
+    batch_stop_button = gtk_button_new_with_label("Stop batch");
+    g_signal_connect(batch_stop_button, "clicked", G_CALLBACK(batch_stop_clicked_cb), NULL);
+    gtk_widget_set_sensitive(batch_stop_button, FALSE);
+    gtk_box_append(GTK_BOX(h), batch_stop_button);
+    gtk_box_append(GTK_BOX(vbox), h);
+    gtk_window_set_child(GTK_WINDOW(batch_dialog), vbox);
+    gtk_window_present(GTK_WINDOW(batch_dialog));
+    if (!batch_files) batch_files = g_ptr_array_new_with_free_func(g_free);
+    /* Populate existing batch entries into listbox */
+    for (guint i = 0; i < batch_files->len; i++) {
+        char *p = g_ptr_array_index(batch_files, i);
+        GtkWidget *row = gtk_label_new(p);
+        gtk_label_set_xalign(GTK_LABEL(row), 0.0);
+        gtk_label_set_ellipsize(GTK_LABEL(row), PANGO_ELLIPSIZE_START);
+        gtk_widget_set_tooltip_text(row, p);
+        gtk_list_box_insert(GTK_LIST_BOX(batch_listbox), row, -1);
+        gtk_widget_set_visible(row, TRUE);
+    }
+}
+
+static gboolean batch_dialog_close_request_cb(GtkWindow *window, gpointer user_data)
+{
+    /* Clear widget globals so the dialog can be recreated later. Keep batch_files
+     * intact (we want to preserve the queued paths). */
+    batch_listbox = NULL;
+    batch_add_folder_button = NULL;
+    batch_add_files_button = NULL;
+    batch_remove_button = NULL;
+    batch_start_button = NULL;
+    batch_stop_button = NULL;
+    batch_dialog = NULL;
+    update_start_button_state();
+    /* Allow default handler to continue (destroy the window) */
+    return FALSE;
+}
+
+static void add_single_file_to_batch(GFile *file)
+{
+    if (!file) return;
+    char *path = g_file_get_path(file);
+    if (!path) return;
+    /* check for duplicates */
+    if (batch_has_path(path)) { g_free(path); return; }
+    /* check media type same as folder logic */
+    GFileInfo *info = g_file_query_info(file, "standard::content-type", G_FILE_QUERY_INFO_NONE, NULL, NULL);
+    gboolean is_media = FALSE;
+    if (info) {
+        const char *ctype = g_file_info_get_content_type(info);
+        if (ctype && (g_str_has_prefix(ctype, "audio/") || g_str_has_prefix(ctype, "video/"))) is_media = TRUE;
+        g_object_unref(info);
+    }
+    if (!is_media) {
+        const char *ext = strrchr(path, '.');
+        if (ext) {
+            gchar *ext_l = g_utf8_strdown(ext + 1, -1);
+            const char *good_exts[] = {"mp4","mkv","webm","avi","mov","mpeg","mpg","mp3","flac","wav","ogg","aac","m4a","opus","m4v","m2ts", NULL};
+            for (int i = 0; good_exts[i] != NULL; i++) {
+                if (g_strcmp0(ext_l, good_exts[i]) == 0) { is_media = TRUE; break; }
+            }
+            g_free(ext_l);
+        }
+    }
+    if (!is_media) { g_free(path); return; }
+
+    if (!batch_files) batch_files = g_ptr_array_new_with_free_func(g_free);
+    g_ptr_array_add(batch_files, g_strdup(path));
+    if (batch_listbox) {
+        GtkWidget *row = gtk_label_new(path);
+        gtk_label_set_xalign(GTK_LABEL(row), 0.0);
+        gtk_label_set_ellipsize(GTK_LABEL(row), PANGO_ELLIPSIZE_START);
+        gtk_widget_set_tooltip_text(row, path);
+        gtk_list_box_insert(GTK_LIST_BOX(batch_listbox), row, -1);
+        gtk_widget_set_visible(row, TRUE);
+        /* Select the first row in the list so the first item is applied */
+        {
+            GtkListBoxRow *to_select = gtk_list_box_get_row_at_index(GTK_LIST_BOX(batch_listbox), 0);
+            if (to_select) gtk_list_box_select_row(GTK_LIST_BOX(batch_listbox), to_select);
+        }
+    }
+    g_free(path);
+}
+
+static void batch_add_files_clicked(GtkButton *button, gpointer user_data)
+{
+    GtkWindow *parent = GTK_WINDOW(user_data);
+    GtkFileChooserNative *native = gtk_file_chooser_native_new("Select files to add", parent, GTK_FILE_CHOOSER_ACTION_OPEN, "Add", "Cancel");
+    gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(native), TRUE);
+    g_signal_connect(native, "response", G_CALLBACK(batch_add_files_native_response), native);
+    gtk_native_dialog_show(GTK_NATIVE_DIALOG(native));
+}
+
+static void batch_add_files_native_response(GtkNativeDialog *native, gint response, gpointer user_data)
+{
+    GtkFileChooserNative *chooser = GTK_FILE_CHOOSER_NATIVE(native);
+    if (response == GTK_RESPONSE_ACCEPT) {
+        GListModel *files = gtk_file_chooser_get_files(GTK_FILE_CHOOSER(chooser));
+        if (files) {
+            gsize n = g_list_model_get_n_items(files);
+            for (gsize i = 0; i < n; i++) {
+                GFile *f = G_FILE(g_list_model_get_item(files, i));
+                if (f) {
+                    add_single_file_to_batch(f);
+                    g_object_unref(f);
+                }
+            }
+            g_object_unref(files);
+        }
+    }
+    gtk_native_dialog_destroy(native);
+}
+
+/* Helper: check whether a given path is already present in batch_files */
+static gboolean batch_has_path(const char *path)
+{
+    if (!path || !batch_files) return FALSE;
+    for (guint i = 0; i < batch_files->len; i++) {
+        char *p = g_ptr_array_index(batch_files, i);
+        if (g_strcmp0(p, path) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+/* Helper: apply a file path as if chosen via file dialog (run autodetection and update UI) */
+static void set_input_and_update_ui(const char *path)
+{
+    if (!path) return;
+    g_free(input_file);
+    input_file = g_strdup(path);
+    gtk_label_set_text(GTK_LABEL(input_label), input_file);
+    g_free(default_audio_codec);
+    g_free(default_video_codec);
+    default_audio_codec = NULL;
+    default_video_codec = NULL;
+    /* run autodetection */
+    detect_defaults(input_file);
+    if (!default_audio_codec) default_audio_codec = g_strdup("copy");
+    if (!default_video_codec) default_video_codec = g_strdup("copy");
+
+    int active_idx = 0;
+    drop_down_set_items_from_ptrarray(audio_combo, &audio_model, audio_codecs, "No audio");
+    if (!input_has_audio) active_idx = 0;
+    else if (default_audio_codec) {
+        int best = find_best_encoder_in_array(audio_codecs, default_audio_codec, audio_encoder_map);
+        active_idx = best + 1;
+    }
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(audio_combo), active_idx);
+
+    active_idx = 0;
+    drop_down_set_items_from_ptrarray(video_combo, &video_model, video_codecs, "No video");
+    if (!input_has_video) active_idx = 0;
+    else if (default_video_codec) {
+        int best = find_best_encoder_in_array(video_codecs, default_video_codec, video_encoder_map);
+        active_idx = best + 1;
+    }
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(video_combo), active_idx);
+
+    if (current_format) {
+        int fidx = find_format_index(current_format);
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(format_combo_audio), fidx);
+        set_codecs_for_format(current_format);
+    } else {
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(format_combo_audio), 0);
+    }
+    update_output_label();
+    /* Enable UI controls now that an input was selected. */
+    update_start_button_state();
+    gtk_widget_set_sensitive(copy_audio_check, TRUE);
+    gtk_widget_set_sensitive(copy_video_check, TRUE);
+    gtk_widget_set_sensitive(format_combo_audio, TRUE);
+    if (input_has_audio) {
+        if (default_audio_codec && g_strcmp0(default_audio_codec, "copy") == 0) {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), TRUE);
+            gtk_widget_set_sensitive(audio_combo, FALSE);
+            gtk_widget_set_sensitive(reset_audio, FALSE);
+        } else {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), FALSE);
+            gtk_widget_set_sensitive(audio_combo, TRUE);
+            gtk_widget_set_sensitive(reset_audio, TRUE);
+        }
+    } else {
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_audio_check), FALSE);
+        gtk_widget_set_sensitive(audio_combo, TRUE);
+        gtk_widget_set_sensitive(reset_audio, TRUE);
+    }
+    if (input_has_video) {
+        if (default_video_codec && g_strcmp0(default_video_codec, "copy") == 0) {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), TRUE);
+            gtk_widget_set_sensitive(video_combo, FALSE);
+            gtk_widget_set_sensitive(reset_video, FALSE);
+        } else {
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), FALSE);
+            gtk_widget_set_sensitive(video_combo, TRUE);
+            gtk_widget_set_sensitive(reset_video, TRUE);
+        }
+    } else {
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(copy_video_check), FALSE);
+        gtk_widget_set_sensitive(video_combo, TRUE);
+        gtk_widget_set_sensitive(reset_video, TRUE);
+    }
+    gtk_widget_set_sensitive(stop_button, FALSE);
+}
+
+/* Callback: when a row in the batch list is selected, apply that file to main UI */
+static void batch_row_selected_cb(GtkListBox *box, GtkListBoxRow *row, gpointer user_data)
+{
+    if (!row) return;
+    GtkWidget *child = gtk_list_box_row_get_child(row);
+    if (!child) return;
+    const char *text = NULL;
+    if (GTK_IS_LABEL(child)) {
+        text = gtk_label_get_text(GTK_LABEL(child));
+    } else {
+        /* If the child is a container, try to find a label by iterating its children using GTK's
+         * widget iterator helpers: use gtk_widget_get_first_child and gtk_widget_get_next_sibling
+         * are not part of stable public API; instead assume our rows are simple labels for now. */
+        return;
+    }
+    if (text) set_input_and_update_ui(text);
+}
+
+/* Wrapper used for the Batch button 'clicked' signal: the signal provides the
+ * GtkButton* as first arg and user_data is the parent window we passed. */
+static void on_batch_button_clicked(GtkButton *button, gpointer user_data)
+{
+    GtkWindow *parent = GTK_WINDOW(user_data);
+    open_batch_dialog(parent);
 }
 
 static gboolean ffmpeg_stdout_cb(GIOChannel *source, GIOCondition condition, gpointer user_data) {
@@ -1028,7 +1563,7 @@ static void on_stop_clicked(GtkButton *button, gpointer user_data) {
         ffmpeg_stderr_chan = NULL;
     }
     // Re-enable UI
-    gtk_widget_set_sensitive(start_button, TRUE);
+    update_start_button_state();
     gtk_widget_set_sensitive(stop_button, FALSE);
     /* Re-enable codec combos unless their 'Copy' checkboxes are active */
     if (!gtk_check_button_get_active(GTK_CHECK_BUTTON(copy_audio_check)))
@@ -1043,19 +1578,11 @@ static void on_stop_clicked(GtkButton *button, gpointer user_data) {
 }
 
 /* Window close */
-/* (removed old Adw dialog response handler) */
-
-/* on_exit_dialog_response (GtkDialog variant) removed; using AdwDialog handler instead */
-
 /* Adwaita dialog response handler: responses are string tokens like "accept"/"cancel" */
 static void on_adw_exit_dialog_response(AdwDialog *dialog, const char *response, gpointer user_data)
 {
     GtkWindow *window = GTK_WINDOW(user_data);
-    if (log_buffer) {
-        gchar *msg = g_strdup_printf("[debug] quit dialog response: %s\n", response ? response : "(null)");
-        gtk_text_buffer_insert_at_cursor(log_buffer, msg, -1);
-        g_free(msg);
-    }
+    (void)log_buffer; /* avoid debug-only access when log_buffer isn't used */
     if (!response) {
         adw_dialog_close(dialog);
         return;
@@ -1078,27 +1605,27 @@ static void on_adw_exit_dialog_response(AdwDialog *dialog, const char *response,
     adw_dialog_close(dialog);
 }
 
-/* Helper for the custom Quit button in the dialog: perform the same
- * actions as the accept response handler, then close both windows. */
-/* on_dialog_quit_clicked removed; responses are handled by on_exit_dialog_response via AdwAlertDialog */
+/* The quit dialog actions are handled by on_adw_exit_dialog_response. */
 
 static gboolean on_window_close_request(GtkWindow *window, gpointer user_data) {
-    /* Build a nicer dialog with icon and wrapped text. If a conversion
-     * is currently running, clarify that quitting will stop it. */
-    const char *title_text = "Quit baConverter";
-    const char *desc_text;
-    /* Keep dialog short and simple; user requested no extra warnings about killing ffmpeg */
-    desc_text = "Do you want to quit baConverter?";
+    /* If ffmpeg is running, show a confirmation dialog because quitting
+     * will stop the conversion. If ffmpeg is not running, allow the
+     * window to close immediately without prompting. */
+    if (ffmpeg_pid > 0) {
+        const char *title_text = "Quit baConverter";
+    const char *desc_text = "A conversion is running. Do you want to quit and stop it?";
+    (void)log_buffer;
+        AdwDialog *d = adw_alert_dialog_new (title_text, desc_text);
+        /* Add responses: 'cancel' for Cancel, 'accept' for Quit */
+        adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (d), "cancel", "_Cancel", "accept", "_Quit", NULL);
+        g_signal_connect (d, "response", G_CALLBACK (on_adw_exit_dialog_response), window);
+        adw_dialog_present (d, GTK_WIDGET (window));
+        return TRUE; /* we've shown our own dialog and prevented immediate close */
+    }
 
-    /* Use an AdwAlertDialog (modern Adwaita dialog) with two responses. */
-    if (log_buffer) gtk_text_buffer_insert_at_cursor(log_buffer, "[debug] presenting quit dialog\n", -1);
-    AdwDialog *d = adw_alert_dialog_new (title_text, desc_text);
-    /* Add responses: 'cancel' for Cancel, 'accept' for Quit */
-    adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (d), "cancel", "_Cancel", "accept", "_Quit", NULL);
-    /* Connect to the AdwDialog string-based response handler which performs the quit actions */
-    g_signal_connect (d, "response", G_CALLBACK (on_adw_exit_dialog_response), window);
-    adw_dialog_present (d, GTK_WIDGET (window));
-    return TRUE; /* we've shown our own dialog */
+    /* No ffmpeg running: allow the window to close without confirmation. */
+    (void)log_buffer;
+    return FALSE;
 }
 
 void
@@ -1125,10 +1652,15 @@ activate (GtkApplication *app)
     gtk_widget_set_margin_start (box, 16);
     gtk_widget_set_margin_end (box, 16);
 
-    /* Choose file button */
+    /* Choose file and Batch buttons */
+    GtkWidget *hchoose = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     choose_button = gtk_button_new_with_label ("Choose input file");
     g_signal_connect(choose_button, "clicked", G_CALLBACK(on_choose_file_clicked), window);
-    gtk_box_append (GTK_BOX (box), choose_button);
+    gtk_box_append (GTK_BOX (hchoose), choose_button);
+    GtkWidget *batch_button = gtk_button_new_with_label ("Batch");
+    g_signal_connect(batch_button, "clicked", G_CALLBACK(on_batch_button_clicked), window);
+    gtk_box_append (GTK_BOX (hchoose), batch_button);
+    gtk_box_append (GTK_BOX (box), hchoose);
 
     /* Input label */
     input_label = gtk_label_new ("No input file selected");
