@@ -5,11 +5,14 @@ Minimal GNOME libadwaita application skeleton named "baConverter".
 Executable: bac
 
 Requirements
-- meson >= 0.60
-- ninja
-- libadwaita-1 (development files)
-- gtk4 (development files)
- - ffmpeg (optional, required for actual media conversion at runtime)
+
+Za Solus Linux namesti vse potrebne pakete za razvoj in zagon z eno samo vrstico:
+
+```sh
+sudo eopkg install meson ninja gcc pkgconf libadwaita-devel libgtk-4-devel libjson-glib-devel glib2-devel gobject-introspection-devel gettext-devel
+```
+
+ffmpeg (opcijsko, samo če želiš dejansko pretvarjati medijske datoteke)
 
 Build
 
