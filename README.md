@@ -1,4 +1,156 @@
+```markdown
 # baConverter
+
+Minimalna GNOME libadwaita aplikacija z imenom "baConverter".
+
+Izvedljiva datoteka: `bac`
+
+Opis
+-----
+baConverter je preprosto namizno orodje za pretvarjanje multimedijskih datotek, napisano v jeziku C z uporabo libadwaita/GTK4. Namenjeno je hitremu in enostavnemu transkodiranju ali kopiranju tokov brez zahtevnega ukaznega vrstice.
+
+Zahteve (kratko)
+-----------------
+- Meson (>=0.60 priporočeno)
+- Ninja
+- C compiler (gcc/clang)
+- libadwaita, GTK4, json-glib (razvojne knjižnice za gradnjo)
+- ffmpeg (opcijsko, za dejansko pretvarjanje medijskih datotek)
+
+Namestitev odvisnosti po distribucijah
+-------------------------------------
+Spodaj so primeri ukazov za namestitev potrebnih paketov na priljubljenih distribucijah. Prilagodi ukaze glede na tvojo distribucijo in verzije paketov.
+
+- Debian / Ubuntu (primer):
+
+```sh
+sudo apt update
+sudo apt install -y build-essential meson ninja-build pkg-config libadwaita-1-dev libgtk-4-dev libjson-glib-dev ffmpeg
+```
+
+- Fedora (primer):
+
+```sh
+sudo dnf install -y meson ninja-build @development-tools pkgconfig libadwaita-devel gtk4-devel json-glib-devel ffmpeg
+```
+
+- Arch / Manjaro (primer):
+
+```sh
+sudo pacman -Syu meson ninja base-devel pkgconf libadwaita gtk4 json-glib ffmpeg
+```
+
+- Solus (primer):
+
+```sh
+# osveži lokalne repozitorije
+sudo eopkg update-repo
+# namešči razvojne in runtime pakete
+sudo eopkg install -y meson ninja gcc pkgconf libjson-glib-devel ffmpeg libgtk-4-devel libadwaita-devel
+```
+
+Opombe za Solus
+---------------
+- Na Solusu je priporočljivo poskrbeti, da je nameščen `pkgconf` ali `pkg-config` (odvisno od imena paketa v repozitoriju). Če je Meson v sistemskih repozitorijih prepočasen, ga lahko nadomestiš z:
+
+```sh
+pipx install meson
+# ali
+pip3 install --user meson
+```
+
+Gradnja
+-------
+1. Konfiguracija gradnje (ustvari build dir):
+
+```sh
+meson setup --buildtype=release build
+```
+
+Če si že imel build direktorij in želiš prekonfigurirati:
+
+```sh
+meson setup --reconfigure build
+```
+
+2. Gradnja (ninja backend):
+
+```sh
+meson compile -C build
+# ali neposredno z ninja
+ninja -C build
+```
+
+3. Izvedba zgrajenega programa (iz projektne mape):
+
+```sh
+./build/src/bac
+```
+
+Namestitev
+----------
+Za sistemsko namestitev:
+
+```sh
+sudo meson install -C build
+# ali
+sudo ninja -C build install
+```
+
+Odstranitev namestitve:
+
+```sh
+sudo ninja -C build uninstall
+```
+
+Kje so artefakti
+----------------
+- Meson build dir: `build/`
+- Izvedljiva datoteka: `build/src/bac` (lokalno)
+- Compile database: `build/compile_commands.json`
+- Meson metapodatki: `build/meson-info/`, `build/meson-logs/`, `build/meson-private/`
+
+Ponovljiv postopek (primer)
+---------------------------
+
+```sh
+# odstranite build, če želite čisto stanje
+rm -rf build/
+# konfigurirajte in zgradite
+meson setup --buildtype=release build
+meson compile -C build
+./build/src/bac
+```
+
+Kratke opombe o runtime odvisnostih
+----------------------------------
+- Program potrebuje knjižnice libadwaita (libadwaita-1), GTK4 in json-glib za zagon GUI.
+- Za pretvarjanje multimedijskih datotek potrebuješ `ffmpeg` (ali drugo orodje), sicer bodo nekatere funkcije omejene.
+
+Reševanje težav
+----------------
+- Če meson javi, da je potrebna višja verzija, posodobi Meson (poglej zgoraj Solus opombo za pipx/pip3).
+- Če se povezovanje ne uspe (linker errors), preveri, da so nameščene razvojne verzije knjižnic (`-devel` or `-dev` paketi).
+- Opozorila o zastarelih GTK funkcijah so običajno varna — delovanje ne bo prekinjeno, a razmisli o posodobitvi API klicev.
+
+Urejanje in razvoj
+------------------
+- Koda uporablja meson kot sistem za gradnjo in je primerna za hitro razvojno iteracijo z `meson setup --reconfigure build` in `meson compile -C build`.
+- Če želiš debug build, uporabi `--buildtype=debug` ali `--buildtype=debugoptimized` pri `meson setup`.
+
+Čiščenje
+--------
+
+```sh
+rm -rf build/
+rm -f compile_commands.json
+```
+
+Licenca
+-------
+Oglej si `LICENSE` datoteko v repozitoriju za pogoje licenciranja.
+
+```# baConverter
 
 Minimal GNOME libadwaita application skeleton named "baConverter".
 
