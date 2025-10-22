@@ -1,0 +1,61 @@
+# Build directory created by Meson/Ninja
+/build/
+
+# Compilation database
+compile_commands.json
+
+# Object files and libraries
+*.o
+*.so
+*.a
+*.lo
+*.la
+
+# Temporary and backup files
+*~
+# swap files
+*.swp
+# macOS
+.DS_Store
+
+# Editor and IDE settings
+.vscode/
+.idea/
+
+# CTags
+tags
+
+# Debug symbols
+*.dSYM/
+
+# Meson private data
+/meson-private/
+
+# Generated metadata
+meson-logs/
+# Ignore build output
+/build/
+
+# Meson/Ninja generated files
+/build/**
+
+# Compile database (generated)
+/compile_commands.json
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python
+venv/
+__pycache__/
+
+# Logs and temporary files
+*.log
+*.tmp
