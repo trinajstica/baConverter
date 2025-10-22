@@ -1,7 +1,15 @@
-# Build directory created by Meson/Ninja
-/build/
+## Ignore build outputs and IDE/editor/settings not needed for compile
 
-# Compilation database
+# Meson / Ninja build output
+/build/
+/build/**
+
+# Meson internal and logs
+/meson-private/
+meson-logs/
+
+# Generated compile database
+/compile_commands.json
 compile_commands.json
 
 # Object files and libraries
@@ -11,44 +19,18 @@ compile_commands.json
 *.lo
 *.la
 
-# Temporary and backup files
-*~
-# swap files
-*.swp
-# macOS
-.DS_Store
-
-# Editor and IDE settings
-.vscode/
-.idea/
-
-# CTags
-tags
-
 # Debug symbols
 *.dSYM/
 
-# Meson private data
-/meson-private/
-
-# Generated metadata
-meson-logs/
-# Ignore build output
-/build/
-
-# Meson/Ninja generated files
-/build/**
-
-# Compile database (generated)
-/compile_commands.json
-
-# Editor directories and files
+# Editor and IDE settings (don't keep per-developer configs in repo)
 .vscode/
 .idea/
-*.swp
-*~
 
-# OS files
+# Editor swap/backup files
+*~
+*.swp
+
+# OS artifacts
 .DS_Store
 Thumbs.db
 
@@ -56,6 +38,7 @@ Thumbs.db
 venv/
 __pycache__/
 
-# Logs and temporary files
+# Misc
+tags
 *.log
 *.tmp
