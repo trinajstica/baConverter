@@ -67,8 +67,10 @@ static void batch_row_selected_cb(GtkListBox *box, GtkListBoxRow *row, gpointer 
 static void batch_add_folder_native_response(GtkNativeDialog *native, gint response, gpointer user_data);
 static void batch_add_files_native_response(GtkNativeDialog *native, gint response, gpointer user_data);
 static void add_single_file_to_batch(GFile *file);
+static void batch_clear_clicked(GtkButton *button, gpointer user_data);
 static gboolean batch_dialog_close_request_cb(GtkWindow *window, gpointer user_data);
 static gboolean batch_has_path(const char *path);
+static gboolean on_drop_received(GtkDropTarget *target, const GValue *value, double x, double y, gpointer user_data);
 
 static gboolean is_batch_dialog_open(void)
 {
@@ -422,6 +424,24 @@ static void drop_down_set_items_from_ptrarray(GtkWidget *dropdown, GtkStringList
     gtk_drop_down_set_selected(GTK_DROP_DOWN(dropdown), 0);
 }
 
+/* Helper: check extension (lowercase, without dot) against whitelist and blacklist
+ * Returns TRUE for known media extensions, FALSE otherwise. Explicitly blacklist
+ * ambiguous extensions like 'mod' to avoid false-positives. */
+static gboolean is_media_extension(const char *ext_l)
+{
+    if (!ext_l) return FALSE;
+    /* blacklist first (explicit rejects) */
+    const char *blacklist[] = {"mod", NULL};
+    for (int i = 0; blacklist[i] != NULL; i++) {
+        if (g_strcmp0(ext_l, blacklist[i]) == 0) return FALSE;
+    }
+    const char *good_exts[] = {"mp4","mkv","webm","avi","mov","mpeg","mpg","mp3","flac","wav","ogg","aac","m4a","opus","m4v","m2ts", NULL};
+    for (int i = 0; good_exts[i] != NULL; i++) {
+        if (g_strcmp0(ext_l, good_exts[i]) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
 static void on_format_combo_changed_generic(GtkDropDown *combo, gpointer user_data)
 {
     gchar *sel = drop_down_get_active_text(GTK_WIDGET(combo), format_model);
@@ -574,10 +594,6 @@ static void detect_defaults(const char *file) {
             g_strfreev(parts);
         }
     }
-
-    input_has_audio = FALSE;
-    input_has_video = FALSE;
-
     for (guint i = 0; i < json_array_get_length(streams); i++) {
         JsonNode *stream_node = json_array_get_element(streams, i);
         JsonObject *stream = json_node_get_object(stream_node);
@@ -1084,21 +1100,45 @@ static void batch_add_folder_clicked(GtkButton *button, gpointer user_data)
 {
     GtkWindow *parent = GTK_WINDOW(user_data);
     /* Use native file chooser in folder-selection mode */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
     GtkFileChooserNative *native = gtk_file_chooser_native_new("Select folder to add", parent, GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER, "Add", "Cancel");
     /* Connect response handler */
     g_signal_connect(native, "response", G_CALLBACK(batch_add_folder_native_response), native);
     gtk_native_dialog_show(GTK_NATIVE_DIALOG(native));
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 static void batch_add_folder_native_response(GtkNativeDialog *native, gint response, gpointer user_data)
 {
     GtkFileChooserNative *chooser = GTK_FILE_CHOOSER_NATIVE(native);
     if (response == GTK_RESPONSE_ACCEPT) {
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
         GFile *f = gtk_file_chooser_get_file(GTK_FILE_CHOOSER(chooser));
         if (f) {
             collect_files_from_folder(f);
             g_object_unref(f);
         }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
     }
     /* destroy the dialog */
     gtk_native_dialog_destroy(native);
@@ -1231,8 +1271,17 @@ static void open_batch_dialog(GtkWindow *parent)
     gtk_widget_set_margin_end(vbox, 8);
     batch_listbox = gtk_list_box_new();
     g_signal_connect(batch_listbox, "row-selected", G_CALLBACK(batch_row_selected_cb), NULL);
-    gtk_widget_set_vexpand(batch_listbox, TRUE);
-    gtk_box_append(GTK_BOX(vbox), batch_listbox);
+    /* Put the listbox inside a scrolled window so the batch list is scrollable */
+    GtkWidget *batch_scrolled = gtk_scrolled_window_new();
+    gtk_widget_set_vexpand(batch_scrolled, TRUE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(batch_scrolled), batch_listbox);
+    /* Accept drag & drop onto the batch list so users can drop files/folders directly */
+    {
+        GtkDropTarget *batch_drop = gtk_drop_target_new(G_TYPE_FILE, GDK_ACTION_COPY);
+        g_signal_connect(batch_drop, "drop", G_CALLBACK(on_drop_received), batch_dialog);
+        gtk_widget_add_controller(batch_listbox, GTK_EVENT_CONTROLLER(batch_drop));
+    }
+    gtk_box_append(GTK_BOX(vbox), batch_scrolled);
     GtkWidget *h = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     batch_add_folder_button = gtk_button_new_with_label("Add folder");
     g_signal_connect(batch_add_folder_button, "clicked", G_CALLBACK(batch_add_folder_clicked), batch_dialog);
@@ -1250,6 +1299,15 @@ static void open_batch_dialog(GtkWindow *parent)
     g_signal_connect(batch_stop_button, "clicked", G_CALLBACK(batch_stop_clicked_cb), NULL);
     gtk_widget_set_sensitive(batch_stop_button, FALSE);
     gtk_box_append(GTK_BOX(h), batch_stop_button);
+    /* Clear (reset) button with symbolic icon, appended at the end so layout places it last */
+    GtkWidget *batch_clear_button = gtk_button_new();
+    GtkWidget *clear_img = gtk_image_new_from_icon_name("edit-clear-symbolic");
+    /* Ensure icon size matches other toolbar icons */
+    gtk_image_set_pixel_size(GTK_IMAGE(clear_img), 16);
+    gtk_button_set_child(GTK_BUTTON(batch_clear_button), clear_img);
+    gtk_widget_set_tooltip_text(batch_clear_button, "Clear list");
+    g_signal_connect(batch_clear_button, "clicked", G_CALLBACK(batch_clear_clicked), NULL);
+    gtk_box_append(GTK_BOX(h), batch_clear_button);
     gtk_box_append(GTK_BOX(vbox), h);
     gtk_window_set_child(GTK_WINDOW(batch_dialog), vbox);
     gtk_window_present(GTK_WINDOW(batch_dialog));
@@ -1301,10 +1359,7 @@ static void add_single_file_to_batch(GFile *file)
         const char *ext = strrchr(path, '.');
         if (ext) {
             gchar *ext_l = g_utf8_strdown(ext + 1, -1);
-            const char *good_exts[] = {"mp4","mkv","webm","avi","mov","mpeg","mpg","mp3","flac","wav","ogg","aac","m4a","opus","m4v","m2ts", NULL};
-            for (int i = 0; good_exts[i] != NULL; i++) {
-                if (g_strcmp0(ext_l, good_exts[i]) == 0) { is_media = TRUE; break; }
-            }
+            if (is_media_extension(ext_l)) is_media = TRUE;
             g_free(ext_l);
         }
     }
@@ -1328,19 +1383,63 @@ static void add_single_file_to_batch(GFile *file)
     g_free(path);
 }
 
+static void batch_clear_clicked(GtkButton *button, gpointer user_data)
+{
+    /* Clear batch_files and remove all rows from the listbox */
+    if (batch_files) {
+        g_ptr_array_set_size(batch_files, 0);
+    }
+    if (batch_listbox) {
+        /* GTK4: remove rows by repeatedly removing row at index 0 until empty */
+        GtkListBoxRow *r;
+        while ((r = gtk_list_box_get_row_at_index(GTK_LIST_BOX(batch_listbox), 0)) != NULL) {
+            gtk_list_box_remove(GTK_LIST_BOX(batch_listbox), GTK_WIDGET(r));
+        }
+    }
+    /* Reset batch index/state */
+    batch_index = 0;
+    batch_running = FALSE;
+    /* Re-enable controls just in case */
+    if (batch_add_folder_button) gtk_widget_set_sensitive(batch_add_folder_button, TRUE);
+    if (batch_add_files_button) gtk_widget_set_sensitive(batch_add_files_button, TRUE);
+    if (batch_remove_button) gtk_widget_set_sensitive(batch_remove_button, TRUE);
+    if (batch_start_button) gtk_widget_set_sensitive(batch_start_button, TRUE);
+    if (batch_stop_button) gtk_widget_set_sensitive(batch_stop_button, FALSE);
+}
+
 static void batch_add_files_clicked(GtkButton *button, gpointer user_data)
 {
     GtkWindow *parent = GTK_WINDOW(user_data);
+    /* Use native dialog; suppress deprecation warnings for compatibility */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
     GtkFileChooserNative *native = gtk_file_chooser_native_new("Select files to add", parent, GTK_FILE_CHOOSER_ACTION_OPEN, "Add", "Cancel");
     gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(native), TRUE);
     g_signal_connect(native, "response", G_CALLBACK(batch_add_files_native_response), native);
     gtk_native_dialog_show(GTK_NATIVE_DIALOG(native));
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 static void batch_add_files_native_response(GtkNativeDialog *native, gint response, gpointer user_data)
 {
     GtkFileChooserNative *chooser = GTK_FILE_CHOOSER_NATIVE(native);
     if (response == GTK_RESPONSE_ACCEPT) {
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
         GListModel *files = gtk_file_chooser_get_files(GTK_FILE_CHOOSER(chooser));
         if (files) {
             gsize n = g_list_model_get_n_items(files);
@@ -1353,8 +1452,56 @@ static void batch_add_files_native_response(GtkNativeDialog *native, gint respon
             }
             g_object_unref(files);
         }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
     }
     gtk_native_dialog_destroy(native);
+}
+
+/* Drag & Drop: accept 'text/uri-list' drops on the main window and add files to batch */
+static gboolean on_drop_received(GtkDropTarget *target, const GValue *value, double x, double y, gpointer user_data)
+{
+    if (!value) return FALSE;
+    GtkWindow *parent = GTK_WINDOW(user_data);
+    /* Ensure batch dialog is open so listbox exists and UI shows queued files */
+    if (!is_batch_dialog_open()) open_batch_dialog(parent);
+
+    /* Prefer GFile drops (works for files and folders) */
+    if (G_VALUE_HOLDS(value, G_TYPE_FILE)) {
+        GFile *file = g_value_get_object(value);
+        if (file) {
+            /* Determine if it's a directory */
+            GFileInfo *info = g_file_query_info(file, "standard::type", G_FILE_QUERY_INFO_NONE, NULL, NULL);
+            if (info) {
+                GFileType type = g_file_info_get_file_type(info);
+                g_object_unref(info);
+                if (type == G_FILE_TYPE_DIRECTORY) {
+                    /* collect files recursively */
+                    collect_files_from_folder(file);
+                    return TRUE;
+                }
+            }
+            /* For regular files, add to batch */
+            add_single_file_to_batch(file);
+            return TRUE;
+        }
+    }
+    /* Fallback: accept URI string */
+    if (G_VALUE_HOLDS(value, G_TYPE_STRING)) {
+        const gchar *uri = g_value_get_string(value);
+        if (uri && g_str_has_prefix(uri, "file://")) {
+            GFile *f = g_file_new_for_uri(uri);
+            if (f) {
+                add_single_file_to_batch(f);
+                g_object_unref(f);
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
 }
 
 /* Helper: check whether a given path is already present in batch_files */
@@ -1780,6 +1927,11 @@ activate (GtkApplication *app)
 
     /* Present the window */
     gtk_window_present (GTK_WINDOW (window));
+
+    /* Accept drag & drop of files onto the main window to open Batch */
+    GtkDropTarget *drop = gtk_drop_target_new(G_TYPE_FILE, GDK_ACTION_COPY);
+    g_signal_connect(drop, "drop", G_CALLBACK(on_drop_received), window);
+    gtk_widget_add_controller(GTK_WIDGET(window), GTK_EVENT_CONTROLLER(drop));
 }
 
 int
