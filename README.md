@@ -19,6 +19,16 @@ baConverter is a simple GTK application for converting video and audio files usi
 - FFmpeg (with ffprobe)
 - Meson (>= 0.60.0)
 
+### Solus (Linux)
+
+If you're on Solus, install the required packages with `eopkg`. Package names on Solus sometimes differ from other distributions; the following command installs the common dependencies used to build and run baConverter:
+
+```bash
+sudo eopkg install -y gtk4 libadwaita json-glib ffmpeg meson ninja ccache pkg-config gcc make
+```
+
+If any development headers are missing (build errors referencing missing headers or pkg-config), try searching for the corresponding development package with `eopkg search <name>` and install the matching package.
+
 ## Building
 
 1. Ensure you have all dependencies installed. On Ubuntu/Debian:
