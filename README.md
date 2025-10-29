@@ -1,131 +1,83 @@
 # baConverter
 
-Minimal GNOME libadwaita application skeleton named "baConverter".
+baConverter is a simple GTK application for converting video and audio files using FFmpeg. It provides an easy-to-use graphical interface for selecting input files, choosing codecs, output formats, and performing batch conversions.
 
-Executable: bac
+## Features
 
-Requirements
+- Convert single or multiple media files
+- Support for various audio and video codecs
+- Batch processing with drag-and-drop support
+- Automatic codec detection from input files
+- Real-time conversion progress and logging
+- Modern GTK4 interface with libadwaita
 
-Za Solus Linux namesti vse potrebne pakete za razvoj in zagon z eno samo vrstico:
+## Dependencies
 
-```sh
-sudo eopkg install meson ninja gcc pkgconf libadwaita-devel libgtk-4-devel libjson-glib-devel glib2-devel gobject-introspection-devel gettext-devel
+- GTK4 (>= 4.8)
+- libadwaita-1
+- json-glib-1.0
+- FFmpeg (with ffprobe)
+- Meson (>= 0.60.0)
+
+## Building
+
+1. Ensure you have all dependencies installed. On Ubuntu/Debian:
+   ```
+   sudo apt install libgtk-4-dev libadwaita-1-dev libjson-glib-dev ffmpeg meson ninja-build
+   ```
+
+2. Clone or download the source code.
+
+3. Navigate to the project directory:
+   ```
+   cd baConverter
+   ```
+
+4. Configure the build:
+   ```
+   meson setup build
+   ```
+
+5. Build the project:
+   ```
+   meson compile -C build
+   ```
+
+## Installation
+
+To install the application system-wide:
+
 ```
-
-ffmpeg (opcijsko, samo če želiš dejansko pretvarjati medijske datoteke)
-
-Build
-
-1. meson setup build
-2. meson compile -C build
-
-Run
-
-./build/bac
-
-Install
-
 meson install -C build
-
-Where build artifacts go
-
-- The Meson build directory is `build/`. Compiled binaries are placed there (e.g. `build/bac`).
-- Installed files (when running `sudo meson install -C build`) are copied to system locations such as `/usr/local/bin` and `/usr/local/share/applications` (desktop entry) and `/usr/local/share/icons/hicolor/...` (icons).
-
-Reproducible steps (example)
-
-```sh
-# configure
-meson setup --reconfigure build
-# build
-ninja -C build
-# run
-./build/bac
 ```
 
-Notes
-- This is a minimal, monolithic C app using libadwaita/GTK4. Window default size is 800x600 and is resizable (responsive). Follow GNOME Human Interface Guidelines and libadwaita styles when adding UI.
+This will install the executable (`bac`), desktop file, and icons.
 
-Why use baConverter?
+## Usage
 
-baConverter is a lightweight, straightforward desktop tool for converting multimedia files on GNOME. It targets users who:
+After installation, you can launch baConverter from your application menu or run `bac` from the terminal.
 
-- quickly transcode video or audio without writing complex command lines;
-- keep or drop audio/video streams using the "copy" option to preserve original quality or to export quickly without re-encoding;
-- export files into common containers (MP4, MKV, WebM, etc.) with sensible default encoder choices;
-- integrate with the GNOME desktop (desktop entry, icons) so the tool is discoverable from the applications menu or shell search.
+### Single File Conversion
 
-For developers, baConverter also:
+1. Click "Choose File" to select an input media file.
+2. Select desired output format and codecs.
+3. Optionally adjust audio/video settings.
+4. Click "Start" to begin conversion.
+5. Monitor progress in the log area.
 
-- serves as a compact example of using libadwaita/GTK4 in C to build a simple GUI tool;
-- demonstrates invoking external programs (ffmpeg/ffprobe) and parsing their output to update the UI.
+### Batch Conversion
 
-Common scenarios include quickly converting mobile phone recordings, preparing files for web delivery, or reducing file sizes for sharing.
+1. Click "Batch" to open the batch processing dialog.
+2. Add files or folders using the buttons or drag-and-drop.
+3. Configure output settings as needed.
+4. Click "Start batch" to process all files.
 
-Dependencies and how to install (if you don't have them)
+### Settings
 
-This project depends on Meson, Ninja and development packages for libadwaita, GTK4 and json-glib. The commands below install the required packages on common distributions.
+- **Format**: Choose output container format (auto, mp4, mkv, etc.)
+- **Audio/Video Codecs**: Select encoders or choose "Copy" to preserve original
+- **Copy checkboxes**: When checked, streams are copied without re-encoding
 
-- Debian/Ubuntu (example):
+## License
 
-```sh
-sudo apt update
-sudo apt install -y build-essential meson ninja-build libadwaita-1-dev libgtk-4-dev libjson-glib-dev ffmpeg
-```
-
-- Fedora (example):
-
-```sh
-sudo dnf install -y meson ninja-build @development-tools libadwaita-devel gtk4-devel json-glib-devel ffmpeg
-```
-
-- Arch/Manjaro (example):
-
-```sh
-sudo pacman -Syu meson ninja base-devel libadwaita gtk4 json-glib ffmpeg
-```
-
-- Solus (example):
-
-```sh
-# refresh local repo metadata first
-sudo eopkg update-repo
-# then install development and runtime packages
-sudo eopkg install -y meson ninja gcc libjson-glib-devel ffmpeg libgtk-4-devel libadwaita-devel
-```
-
-Notes for Solus:
-- `pkg-config` is usually available on a developer system; if it's missing, install the relevant package from the repos.
-- If the Meson in Solus repos is older than the project's `meson_version` requirement, install Meson via `pipx` or `pip3 --user` to get a newer version:
-
-```sh
-pipx install meson
-# or
-pip3 install --user meson
-```
-
-Build, install and uninstall
-
-```sh
-# configure (run once, or use --reconfigure to update)
-meson setup --reconfigure build
-# build
-ninja -C build
-# run locally
-./build/bac
-# install system-wide (may require sudo)
-sudo ninja -C build install
-# uninstall (from same build dir)
-sudo ninja -C build uninstall
-```
-
-Cleaning up
-
-- To remove the local build directory and generated files:
-
-```sh
-rm -rf build/
-rm -f compile_commands.json
-```
-
-- To remove installed files after `meson install` if `ninja uninstall` did not remove everything, check `/usr/local/bin`, `/usr/local/share/applications` and `/usr/local/share/icons/hicolor/` and manually remove the `bac` binary and installed desktop/icon files.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
