@@ -21,13 +21,25 @@ baConverter is a simple GTK application for converting video and audio files usi
 
 ### Solus (Linux)
 
-If you're on Solus, install the required packages with `eopkg`. Package names on Solus sometimes differ from other distributions; the following command installs the common dependencies used to build and run baConverter:
+Solus uses different package names and provides separate `-devel` packages for headers and pkg-config metadata. For development (building from source) install the runtime and development packages below.
+
+Recommended (build + runtime):
 
 ```bash
-sudo eopkg install -y gtk4 libadwaita json-glib ffmpeg meson ninja ccache pkg-config gcc make
+sudo eopkg install -y libgtk-4 libgtk-4-devel libadwaita libadwaita-devel \
+   libjson-glib libjson-glib-devel ffmpeg ffmpeg-devel meson ninja ccache \
+   pkgconf pkgconf-devel gcc make
 ```
 
-If any development headers are missing (build errors referencing missing headers or pkg-config), try searching for the corresponding development package with `eopkg search <name>` and install the matching package.
+If you only need to run the already-built application (no compilation), you can install the runtime packages:
+
+```bash
+sudo eopkg install -y libgtk-4 libadwaita libjson-glib ffmpeg pkgconf
+```
+
+Notes:
+- `pkgconf` provides the `pkg-config` functionality on Solus; use `pkgconf-devel` for development files.
+- If you run into missing headers during compile, search for the corresponding `-devel` package with `eopkg search <library>` and install it.
 
 ## Building
 
