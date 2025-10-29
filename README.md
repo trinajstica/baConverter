@@ -1,4 +1,3 @@
-```markdown
 # baConverter
 
 Minimalna GNOME libadwaita aplikacija z imenom "baConverter".
