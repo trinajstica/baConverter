@@ -19,6 +19,10 @@
 - `python3-tk` (tkinter) — za GUI
 - opcijsko: `tkinterdnd2>=0.4.4` ali `tkdnd` za povleci in spusti v GUI
 
+Če `tkinterdnd2` ob zagonu ni nameščen, baC vpraša za samodejno namestitev
+paketa prek trenutnega Pythona. Če namestitev zavrnete ali ne uspe, lahko
+datoteke še vedno odpirate z gumbom »Odpri MKV«.
+
 ### Namestitev (primer: Debian/Ubuntu)
 
 ```bash
@@ -59,10 +63,10 @@ sudo ln -s $(pwd)/bac.py /usr/local/bin/bac
 
 Hiter način za obdelavo trenutnega imenika:
 
-- `python3 bac.py -q`  — hitro združi video + srt, ohrani izvorne datoteke
-- `python3 bac.py -qq` — kot zgoraj, vendar izbriše izvorne datoteke po uspehu
+- `python3 bac.py -q`  — za vsak MKV ustvari kopijo `_bac`: video ostane nespremenjen, ostane en angleški zvočni zapis (če ga ni, prvi), podnapisi pa so samo slovenski, sicer hrvaški, sicer bosanski, sicer srbski v latinici. Edini ohranjeni podnapisi so privzeti.
+- `python3 bac.py -qq` — kot zgoraj, vendar po uspehu zamenja izvorni MKV.
 
-CLI poišče video datoteke (.mp4, .avi, .mov, ...), poišče pripadajoče `.srt` datoteke z enakim imenom, po potrebi pretvori zvok v AAC in ustvari `.mkv` z združenimi podnapisi.
+CLI poišče video datoteke (.mp4, .avi, .mov, ...) in MKV-je, poišče pripadajoče `.srt` datoteke z enakim imenom ter po potrebi pretvori izbrani zvok v AC3. Zunanji pripadajoči SRT se obravnava kot slovenski podnapis in ima prednost.
 
 ## Galerija slik 🖼️
 

@@ -6,18 +6,22 @@ Avtor: BArko & SimOne
 Uporaba:
   bac          - Zaženi GUI
   bac film.mkv - Zaženi GUI in odpri MKV datoteko
-  bac -q       - Hitro združi vse video+srt v trenutnem imeniku v MKV
-  bac -qq      - Kot -q, ampak izbriše izvorne datoteke po pretvorbi
+  bac -q       - Uredi MKV: en zvok in en prednostni podnapis
+  bac -qq      - Kot -q, ampak zamenja izvorne datoteke po uspehu
 """
 
 verzija = "v1.0.7"
 
 import argparse
+import importlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 import tkinter as tk
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +42,77 @@ def normaliziraj_pot_argumenta(vrednost):
     return pot
 
 
+def _uvozi_tkinterdnd2():
+    """Vrne TkinterDnD razred, če je dodatna knjižnica na voljo."""
+    try:
+        from tkinterdnd2 import TkinterDnD
+
+        return TkinterDnD
+    except ImportError:
+        return None
+
+
+def _pripravi_tkinterdnd2():
+    """Po potrebi ponudi namestitev podpore za povleci in spusti."""
+    tkinter_dnd = _uvozi_tkinterdnd2()
+    if tkinter_dnd is not None:
+        return tkinter_dnd
+
+    bootstrap = tk.Tk()
+    bootstrap.withdraw()
+    namesti = messagebox.askyesno(
+        "Manjka podpora za povleci in spusti",
+        "Za povleci in spusti manjka paket tkinterdnd2.\n\n"
+        "Ali ga želi baC samodejno namestiti?",
+        parent=bootstrap,
+    )
+    if not namesti:
+        bootstrap.destroy()
+        return None
+
+    ukaz = [sys.executable, "-m", "pip", "install"]
+    # V sistemskem Pythonu namesti paket za trenutnega uporabnika. V virtualnem
+    # okolju --user ni dovoljen oziroma ni smiseln, zato uporabimo okolje samo.
+    if getattr(sys, "prefix", sys.executable) == getattr(
+        sys, "base_prefix", sys.prefix
+    ):
+        ukaz.append("--user")
+    ukaz.append("tkinterdnd2>=0.4.4")
+
+    try:
+        rezultat = subprocess.run(
+            ukaz,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.TimeoutExpired) as napaka:
+        rezultat = None
+        napaka_besedilo = str(napaka)
+    else:
+        napaka_besedilo = (rezultat.stderr or rezultat.stdout or "").strip()
+
+    importlib.invalidate_caches()
+    tkinter_dnd = _uvozi_tkinterdnd2()
+    bootstrap.destroy()
+
+    if rezultat is not None and rezultat.returncode == 0 and tkinter_dnd is not None:
+        return tkinter_dnd
+
+    sporocilo = "Namestitev paketa tkinterdnd2 ni uspela."
+    if napaka_besedilo:
+        sporocilo += f"\n\n{napaka_besedilo[:1200]}"
+    messagebox.showwarning(
+        "Povleci in spusti ni na voljo",
+        sporocilo + "\n\nDatoteke lahko še vedno odpirate z gumbom 'Odpri MKV'.",
+    )
+    return None
+
+
+class OperacijaPrekinjena(Exception):
+    """Izjema za nadzorovano prekinitev operacije ob zapiranju GUI-ja."""
+
+
 class BaMKV:
     def __init__(self, root, prisiljena_tema=None, zacetne_datoteke=None):
         self.root = root
@@ -52,6 +127,16 @@ class BaMKV:
         self._drag_drop_nastavljen = False
         self._drop_callback_po_widgetu = {}
         self._wayland_drop_funcid = None
+        self._gui_zaklenjen = False
+        self._stanja_widgetov = []
+        self._stanja_zavihkov = []
+        self._zaklenjen_zavihek = None
+        self._zavihek_bind_id = None
+        self._trenutni_proces = None
+        self._zapiranje = False
+        self._predpomnjena_mkv_pot = None
+        self._predpomnjene_sledi = None
+        self.root.protocol("WM_DELETE_WINDOW", self._zapri_aplikacijo)
 
         # Zaznaj temo in nastavi barve
         self._nastavi_temo()
@@ -240,6 +325,11 @@ class BaMKV:
         )
         stil.configure(
             "TLabel", background=self.barve["ozadje"], foreground=self.barve["besedilo"]
+        )
+        stil.configure(
+            "Napredek.TLabel",
+            background=self.barve["ozadje_okvir"],
+            foreground=self.barve["besedilo"],
         )
         stil.configure(
             "TButton",
@@ -1062,6 +1152,8 @@ class BaMKV:
 
     def _nastavi_zasedeno(self, sporocilo):
         """Nastavi aplikacijo v zaseden način s sporočilom."""
+        if not self._gui_zaklenjen:
+            self._zakleni_gui()
         self.status.config(text=sporocilo)
         self.napredek.pack(side="right", padx=(10, 0))
         self.napredek.start(10)
@@ -1072,9 +1164,239 @@ class BaMKV:
         """Nastavi aplikacijo nazaj v prosto stanje."""
         self.napredek.stop()
         self.napredek.pack_forget()
+        if hasattr(self, "okvir_napredek_operacij"):
+            self.napredek_operacij.stop()
+            self.napredek_operacij.configure(mode="determinate")
+            self.okvir_napredek_operacij.pack_forget()
+        if hasattr(self, "gumb_izvedi"):
+            self.gumb_izvedi.config(state="normal")
         self.root.config(cursor="")
         self.status.config(text=sporocilo)
+        if self._zapiranje:
+            # Zapiranje odložimo do izhoda iz trenutnega callbacka; sicer bi
+            # root.destroy() znotraj root.update() prekinil tekoči ukaz GUI-ja.
+            self.root.after(50, self.root.destroy)
+            return
+        self._odkleni_gui()
         self.root.update()
+
+    def _sprehodi_widgete(self, widget):
+        """Vrne vse podrejene widgete, tudi v ugnezdenih okvirjih."""
+        for otrok in widget.winfo_children():
+            yield otrok
+            yield from self._sprehodi_widgete(otrok)
+
+    def _zakleni_gui(self):
+        """Onemogoči vse interaktivne kontrole, medtem ko operacija teče."""
+        self._gui_zaklenjen = True
+        self._stanja_widgetov = []
+        self._stanja_zavihkov = []
+        if hasattr(self, "zavihki"):
+            self._zaklenjen_zavihek = self.zavihki.index("current")
+            for indeks in range(self.zavihki.index("end")):
+                stanje = self.zavihki.tab(indeks, "state")
+                self._stanja_zavihkov.append((indeks, stanje))
+                if indeks != self._zaklenjen_zavihek:
+                    self.zavihki.tab(indeks, state="disabled")
+            self._zavihek_bind_id = self.zavihki.bind(
+                "<Button-1>", self._blokiraj_klike_zavihkov, add="+"
+            )
+        try:
+            self.meni_sledi.unpost()
+        except (AttributeError, tk.TclError):
+            pass
+
+        for widget in self._sprehodi_widgete(self.root):
+            # Indikatorji niso interaktivni in morajo ostati vizualno aktivni.
+            if (
+                isinstance(widget, ttk.Progressbar)
+                or widget is getattr(self, "opis_napredka_operacij", None)
+                or widget is getattr(self, "zavihki", None)
+            ):
+                continue
+            try:
+                stanje = widget.cget("state")
+            except (tk.TclError, AttributeError):
+                continue
+            if stanje != "disabled":
+                try:
+                    widget.configure(state="disabled")
+                    self._stanja_widgetov.append((widget, stanje))
+                except tk.TclError:
+                    pass
+
+    def _odkleni_gui(self):
+        """Obnovi stanja kontrol po koncu operacije."""
+        if hasattr(self, "zavihki"):
+            if self._zavihek_bind_id:
+                self.zavihki.unbind("<Button-1>", self._zavihek_bind_id)
+                self._zavihek_bind_id = None
+            for indeks, stanje in self._stanja_zavihkov:
+                try:
+                    self.zavihki.tab(indeks, state=stanje)
+                except tk.TclError:
+                    pass
+        self._stanja_zavihkov = []
+        self._zaklenjen_zavihek = None
+        for widget, stanje in self._stanja_widgetov:
+            try:
+                widget.configure(state=stanje)
+            except tk.TclError:
+                pass
+        self._stanja_widgetov = []
+        self._gui_zaklenjen = False
+
+    def _blokiraj_klike_zavihkov(self, _dogodek):
+        """Med operacijo prepreči menjavo zavihka, tudi na trenutnem zavihku."""
+        return "break"
+
+    def _ubij_trenutni_proces(self):
+        """Ustavi trenutni ukaz skupaj z morebitnimi podprocesi."""
+        proces = self._trenutni_proces
+        if proces is None or proces.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proces.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            proces.terminate()
+
+    def _zapri_aplikacijo(self):
+        """Zapre GUI; med operacijo pred tem zahteva potrditev prekinitve."""
+        if not self._gui_zaklenjen:
+            self.root.destroy()
+            return
+
+        if not messagebox.askyesno(
+            "Prekini operacijo?",
+            "Operacija še teče. Ali jo želite prekiniti in zapreti aplikacijo?",
+            parent=self.root,
+        ):
+            return
+
+        self._zapiranje = True
+        self._ubij_trenutni_proces()
+
+    def _nastavi_napredek_operacij(self, vrednost, sporocilo):
+        """Prikaže napredek ali nedoločen indikator za dolgotrajno fazo."""
+        if not hasattr(self, "okvir_napredek_operacij"):
+            return
+        self.napredek_operacij.stop()
+        if vrednost is None:
+            self.napredek_operacij.configure(mode="indeterminate")
+            self.opis_napredka_operacij.config(text=sporocilo)
+            self.napredek_operacij.start(10)
+        else:
+            self.napredek_operacij.configure(mode="determinate")
+            self.napredek_operacij_var.set(vrednost)
+            self.opis_napredka_operacij.config(
+                text=f"{sporocilo} ({int(vrednost)} %)"
+            )
+        self.okvir_napredek_operacij.pack(
+            fill="x", pady=(5, 0), before=self.drevo_operacije
+        )
+        self.root.update_idletasks()
+
+    def _izvedi_ukaz_z_osvezevanjem(self, ukaz):
+        """Izvede zunanji ukaz in vmes omogoči osveževanje prikaza napredka."""
+        # Začasni datoteki preprečita blokado procesa, do katere pride, če se
+        # PIPE napolni z izhodom ffmpeg/mkvmerge, medtem ko GUI čaka.
+        try:
+            with tempfile.TemporaryFile() as stdout_dat:
+                with tempfile.TemporaryFile() as stderr_dat:
+                    povratna_koda, stdout, stderr = (
+                        self._izvedi_proces_z_datotekama(
+                            ukaz, stdout_dat, stderr_dat
+                        )
+                    )
+        except OSError as e:
+            # Tudi napake zagona (npr. izbrisano orodje ali nedostopna mapa)
+            # pretvorimo v obliko, ki jo vsi GUI postopki že obravnavajo.
+            raise subprocess.CalledProcessError(
+                e.errno or 1,
+                ukaz,
+                stderr=str(e).encode(errors="replace"),
+            ) from e
+
+        if self._zapiranje:
+            raise OperacijaPrekinjena()
+        if povratna_koda:
+            raise subprocess.CalledProcessError(
+                povratna_koda, ukaz, output=stdout, stderr=stderr
+            )
+        return stdout, stderr
+
+    def _izvedi_proces_z_datotekama(self, ukaz, stdout_dat, stderr_dat):
+        """Izvede proces z izhodom v datotekah, ki se ne moreta napolniti."""
+        proces = subprocess.Popen(
+            ukaz,
+            stdout=stdout_dat,
+            stderr=stderr_dat,
+            start_new_session=True,
+        )
+        self._trenutni_proces = proces
+        try:
+            if self._zapiranje:
+                self._ubij_trenutni_proces()
+            while proces.poll() is None:
+                self.root.update_idletasks()
+                self.root.update()
+                if self._zapiranje:
+                    self._ubij_trenutni_proces()
+                    break
+                time.sleep(0.05)
+
+            if self._zapiranje:
+                try:
+                    proces.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(os.getpgid(proces.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        proces.kill()
+                    proces.wait()
+            else:
+                proces.wait()
+            stdout_dat.seek(0)
+            stderr_dat.seek(0)
+            stdout = stdout_dat.read()
+            stderr = stderr_dat.read()
+        finally:
+            self._trenutni_proces = None
+
+        return proces.returncode, stdout, stderr
+
+    @staticmethod
+    def _opis_napake_procesa(napaka):
+        """Varno pretvori stderr procesa ali izjemo v besedilo za uporabnika."""
+        stderr = getattr(napaka, "stderr", None)
+        if isinstance(stderr, bytes):
+            return stderr.decode(errors="replace")
+        if stderr:
+            return str(stderr)
+        return str(napaka)
+
+    @staticmethod
+    def _nova_zacasna_mkv_pot(ciljna_pot, oznaka):
+        """Vrne enolično prosto pot za začasno MKV ob ciljni datoteki."""
+        cilj = Path(ciljna_pot)
+        fd, pot = tempfile.mkstemp(
+            prefix=f".{cilj.stem}_{oznaka}_",
+            suffix=".mkv",
+            dir=str(cilj.parent),
+        )
+        os.close(fd)
+        os.remove(pot)
+        return pot
+
+    @staticmethod
+    def _varno_odstrani(pot):
+        """Odstrani začasno datoteko, če obstaja, brez prekrivanja prvotne napake."""
+        if not pot:
+            return
+        try:
+            os.remove(pot)
+        except OSError:
+            pass
 
     def _poisci_orodje(self, ime):
         """Poišče orodje v sistemu, vključno s flatpak paketi."""
@@ -1321,9 +1643,11 @@ class BaMKV:
         okvir_dodaj = ttk.Frame(okvir_sledi)
         okvir_dodaj.pack(fill="x", pady=5)
 
-        ttk.Button(okvir_dodaj, text="Osveži", command=self._osvezi_sledi).pack(
-            side="left", padx=2
-        )
+        ttk.Button(
+            okvir_dodaj,
+            text="Osveži",
+            command=lambda: self._osvezi_sledi(prisilno=True),
+        ).pack(side="left", padx=2)
         self.gumb_podnapisi = ttk.Button(
             okvir_dodaj, text="+ Podnapisi", command=self._op_dodaj_podnapise
         )
@@ -1365,13 +1689,32 @@ class BaMKV:
             okvir_gumbi, text="Počisti vse", command=self._pocisti_operacije
         ).pack(side="left", padx=2)
 
-        gumb_izvedi = ttk.Button(
+        self.okvir_napredek_operacij = ttk.Frame(okvir_operacije)
+        self.opis_napredka_operacij = ttk.Label(
+            self.okvir_napredek_operacij,
+            text="Pripravljam...",
+            style="Napredek.TLabel",
+        )
+        self.opis_napredka_operacij.pack(anchor="w")
+        self.napredek_operacij_var = tk.DoubleVar(value=0)
+        self.napredek_operacij = ttk.Progressbar(
+            self.okvir_napredek_operacij,
+            variable=self.napredek_operacij_var,
+            maximum=100,
+            mode="determinate",
+        )
+        self.napredek_operacij.pack(fill="x", pady=(3, 0))
+
+        self.gumb_izvedi = ttk.Button(
             okvir_gumbi, text="▶ Izvedi vse", command=self._izvedi_operacije
         )
-        gumb_izvedi.pack(side="right", padx=2, ipadx=10)
+        self.gumb_izvedi.pack(side="right", padx=2, ipadx=10)
 
     def _prikazi_meni_sledi(self, dogodek):
         """Prikaže kontekstni meni za izbrano sled."""
+        if self._gui_zaklenjen:
+            self._zapri_meni_sledi()
+            return "break"
         self.meni_sledi.unpost()
         vrstica = self.drevo_sledi.identify_row(dogodek.y)
         if vrstica:
@@ -1618,7 +1961,10 @@ class BaMKV:
         if not ciljna_pot.endswith(".mkv"):
             ciljna_pot += ".mkv"
 
+        self.gumb_izvedi.config(state="disabled")
         self._nastavi_zasedeno("Izvajam operacije...")
+        self._nastavi_napredek_operacij(None, "Pripravljam operacije …")
+        zacasna_pot = None
 
         try:
             # Zberi podatke za mkvmerge
@@ -1660,14 +2006,24 @@ class BaMKV:
                 op["tip"] == "Dodaj podnapise" and op["podatki"].get("zamenjaj")
                 for op in self.cakalne_operacije
             )
+            samo_pretvorbe = all(
+                op["tip"] in ("Pretvori zvok", "Pretvori video")
+                for op in self.cakalne_operacije
+            )
 
             # Če je potrebna pretvorba zvoka, najprej uporabi ffmpeg
             vhodna_datoteka = self.mkv_pot
-            zacasna_pot = None
 
             if (pretvorbe_zvoka or pretvorbe_videa) and self.ffmpeg:
                 self._nastavi_zasedeno("Pretvarjam izbrane sledi...")
-                zacasna_pot = ciljna_pot.replace(".mkv", "_temp_tracks.mkv")
+                self._nastavi_napredek_operacij(None, "Pretvarjam izbrane sledi …")
+                if samo_pretvorbe:
+                    izhod_pretvorbe = ciljna_pot
+                else:
+                    zacasna_pot = self._nova_zacasna_mkv_pot(
+                        ciljna_pot, "temp_tracks"
+                    )
+                    izhod_pretvorbe = zacasna_pot
 
                 if "flatpak run" in self.ffmpeg:
                     ukaz_ff = self.ffmpeg.split() + ["-i", self.mkv_pot, "-y"]
@@ -1693,11 +2049,24 @@ class BaMKV:
                         [f"-c:{stevilka}", kodeki_videa.get(kodek, "libx264"), "-crf", "23"]
                     )
 
-                ukaz_ff.append(zacasna_pot)
-                subprocess.run(ukaz_ff, check=True, capture_output=True)
-                vhodna_datoteka = zacasna_pot
+                ukaz_ff.append(izhod_pretvorbe)
+                self._izvedi_ukaz_z_osvezevanjem(ukaz_ff)
+                vhodna_datoteka = izhod_pretvorbe
+
+                # Če seznam vsebuje samo pretvorbe, je rezultat ffmpeg že
+                # končni MKV. Drugi celoten prepis z mkvmerge ni potreben.
+                if samo_pretvorbe:
+                    self._pocisti_operacije()
+                    self._nastavi_napredek_operacij(100, "Končano")
+                    self._nastavi_prosto("Operacije uspešno izvedene.")
+                    messagebox.showinfo(
+                        "Uspeh",
+                        f"Vse operacije uspešno izvedene!\n\nShranjeno v:\n{ciljna_pot}",
+                    )
+                    return
 
             self._nastavi_zasedeno("Združujem s pomočjo mkvmerge...")
+            self._nastavi_napredek_operacij(None, "Združujem datoteke …")
 
             # Pripravi mkvmerge ukaz
             if "flatpak run" in self.mkvmerge:
@@ -1765,23 +2134,29 @@ class BaMKV:
                     ukaz.extend(["--default-track", "0:yes"])
                 ukaz.append(dat["pot"])
 
-            subprocess.run(ukaz, check=True, capture_output=True)
+            self._izvedi_ukaz_z_osvezevanjem(ukaz)
 
             # Počisti začasne datoteke
-            if zacasna_pot and os.path.exists(zacasna_pot):
-                os.remove(zacasna_pot)
+            self._nastavi_napredek_operacij(None, "Zaključujem …")
+            self._varno_odstrani(zacasna_pot)
 
             self._pocisti_operacije()
+            self._nastavi_napredek_operacij(100, "Končano")
             self._nastavi_prosto("Operacije uspešno izvedene.")
             messagebox.showinfo(
                 "Uspeh",
                 f"Vse operacije uspešno izvedene!\n\nShranjeno v:\n{ciljna_pot}",
             )
 
-        except subprocess.CalledProcessError as e:
-            napaka = e.stderr.decode() if e.stderr else str(e)
+        except (subprocess.CalledProcessError, OperacijaPrekinjena, OSError) as e:
+            if self._zapiranje:
+                self._nastavi_prosto("Operacija prekinjena.")
+                return
+            napaka = self._opis_napake_procesa(e)
             self._nastavi_prosto("Napaka pri izvajanju.")
             messagebox.showerror("Napaka", f"Napaka pri izvajanju operacij:\n{napaka}")
+        finally:
+            self._varno_odstrani(zacasna_pot)
 
     def _ustvari_podnapisi(self, okvir):
         """Ustvari zavihek za dodajanje podnapisov."""
@@ -2154,13 +2529,16 @@ class BaMKV:
 
                 ukaz.append(pot)
 
-            subprocess.run(ukaz, check=True, capture_output=True)
+            self._izvedi_ukaz_z_osvezevanjem(ukaz)
             self._nastavi_prosto("MKV ustvarjen.")
             messagebox.showinfo(
                 "Uspeh", f"MKV uspešno ustvarjen!\n\nShranjeno v:\n{ciljna_pot}"
             )
-        except subprocess.CalledProcessError as e:
-            napaka = e.stderr.decode() if e.stderr else str(e)
+        except (subprocess.CalledProcessError, OperacijaPrekinjena, OSError) as e:
+            if self._zapiranje:
+                self._nastavi_prosto("Operacija prekinjena.")
+                return
+            napaka = self._opis_napake_procesa(e)
             self._nastavi_prosto("Napaka pri ustvarjanju.")
             messagebox.showerror("Napaka", f"Napaka pri ustvarjanju MKV:\n{napaka}")
 
@@ -2600,8 +2978,14 @@ class BaMKV:
                     "-show_streams", pot,
                 ]
 
-            rezultat = subprocess.run(ukaz, capture_output=True, text=True, check=True)
-            podatki = json.loads(rezultat.stdout)
+            if self._gui_zaklenjen:
+                stdout, _ = self._izvedi_ukaz_z_osvezevanjem(ukaz)
+                podatki = json.loads(stdout.decode())
+            else:
+                rezultat = subprocess.run(
+                    ukaz, capture_output=True, text=True, check=True
+                )
+                podatki = json.loads(rezultat.stdout)
             for sled in podatki.get("streams", []):
                 if sled.get("codec_type") == "audio":
                     return sled.get("codec_name"), sled.get("index")
@@ -2625,7 +3009,7 @@ class BaMKV:
 
         # Izbrane datoteke
         izbrane = [
-            self.hitro_datoteke[int(i)]
+            dict(self.hitro_datoteke[int(i)])
             for i in sorted(self.hitro_izbrane, key=int)
             if int(i) < len(self.hitro_datoteke)
         ]
@@ -2653,6 +3037,7 @@ class BaMKV:
             ciljna_pot += ".mkv"
 
         self._nastavi_zasedeno("Pretvarjam v MKV...")
+        zacasna_pot = None
 
         try:
             # Preveri audio kodek in indeks prvega audio streama
@@ -2675,7 +3060,7 @@ class BaMKV:
                 self._nastavi_zasedeno("Pretvarjam zvok v AC3...")
 
                 # Začasna datoteka za pretvorjen video
-                zacasna_pot = ciljna_pot.replace(".mkv", "_temp.mkv")
+                zacasna_pot = self._nova_zacasna_mkv_pot(ciljna_pot, "temp_audio")
 
                 if "flatpak run" in self.ffmpeg:
                     ukaz_ff = self.ffmpeg.split() + ["-i", video_pot, "-y"]
@@ -2691,7 +3076,7 @@ class BaMKV:
                 ukaz_ff.extend(["-c:a", "ac3", "-b:a", "192k"])
                 ukaz_ff.append(zacasna_pot)
 
-                subprocess.run(ukaz_ff, check=True, capture_output=True)
+                self._izvedi_ukaz_z_osvezevanjem(ukaz_ff)
 
                 # Posodobi pot videa
                 for dat in izbrane:
@@ -2727,21 +3112,24 @@ class BaMKV:
 
                 ukaz.append(dat["pot"])
 
-            subprocess.run(ukaz, check=True, capture_output=True)
+            self._izvedi_ukaz_z_osvezevanjem(ukaz)
 
             # Počisti začasne datoteke
-            for dat in izbrane:
-                if dat.get("zacasna") and os.path.exists(dat["pot"]):
-                    os.remove(dat["pot"])
+            self._varno_odstrani(zacasna_pot)
 
             self._nastavi_prosto("Pretvorba končana.")
             messagebox.showinfo(
                 "Uspeh", f"MKV uspešno ustvarjen!\n\nShranjeno v:\n{ciljna_pot}"
             )
-        except subprocess.CalledProcessError as e:
-            napaka = e.stderr.decode() if e.stderr else str(e)
+        except (subprocess.CalledProcessError, OperacijaPrekinjena, OSError) as e:
+            if self._zapiranje:
+                self._nastavi_prosto("Operacija prekinjena.")
+                return
+            napaka = self._opis_napake_procesa(e)
             self._nastavi_prosto("Napaka pri pretvorbi.")
             messagebox.showerror("Napaka", f"Napaka pri pretvorbi:\n{napaka}")
+        finally:
+            self._varno_odstrani(zacasna_pot)
 
     def _odpri_mkv(self):
         """Odpre dialog za izbiro MKV datoteke."""
@@ -2764,10 +3152,17 @@ class BaMKV:
             return flatpak_deli + ukaz[1:]
         return ukaz
 
-    def _pridobi_informacije(self):
+    def _pridobi_informacije(self, prisilno=False):
         """Pridobi informacije o sledeh v MKV datoteki."""
         if not self.mkv_pot or not self.ffprobe:
             return []
+
+        if (
+            not prisilno
+            and self._predpomnjena_mkv_pot == self.mkv_pot
+            and self._predpomnjene_sledi is not None
+        ):
+            return self._predpomnjene_sledi
 
         try:
             if "flatpak run" in self.ffprobe:
@@ -2790,20 +3185,29 @@ class BaMKV:
                     "-show_streams",
                     self.mkv_pot,
                 ]
-            rezultat = subprocess.run(ukaz, capture_output=True, text=True, check=True)
-            podatki = json.loads(rezultat.stdout)
-            return podatki.get("streams", [])
+            if self._gui_zaklenjen:
+                stdout, _ = self._izvedi_ukaz_z_osvezevanjem(ukaz)
+                podatki = json.loads(stdout.decode())
+            else:
+                rezultat = subprocess.run(
+                    ukaz, capture_output=True, text=True, check=True
+                )
+                podatki = json.loads(rezultat.stdout)
+            sledi = podatki.get("streams", [])
+            self._predpomnjena_mkv_pot = self.mkv_pot
+            self._predpomnjene_sledi = sledi
+            return sledi
         except Exception as e:
             messagebox.showerror("Napaka", f"Napaka pri branju datoteke:\n{e}")
             return []
 
-    def _osvezi_sledi(self):
+    def _osvezi_sledi(self, prisilno=False):
         """Osveži seznam sledi."""
         for vrstica in self.drevo_sledi.get_children():
             self.drevo_sledi.delete(vrstica)
 
         self.stevilke_sledi = []
-        sledi = self._pridobi_informacije()
+        sledi = self._pridobi_informacije(prisilno=prisilno)
 
         prevod_vrste = {"video": "Video", "audio": "Zvok", "subtitle": "Podnapisi"}
 
@@ -2932,15 +3336,19 @@ class BaMKV:
 
             ukaz.append(pot_podnapis)
 
-            subprocess.run(ukaz, check=True, capture_output=True)
+            self._izvedi_ukaz_z_osvezevanjem(ukaz)
             self._nastavi_prosto("Podnapisi dodani.")
             messagebox.showinfo(
                 "Uspeh", f"Podnapisi uspešno dodani!\n\nShranjeno v:\n{ciljna_pot}"
             )
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, OperacijaPrekinjena, OSError) as e:
+            if self._zapiranje:
+                self._nastavi_prosto("Operacija prekinjena.")
+                return
             self._nastavi_prosto("Napaka pri dodajanju.")
             messagebox.showerror(
-                "Napaka", f"Napaka pri dodajanju podnapisov:\n{e.stderr.decode()}"
+                "Napaka",
+                f"Napaka pri dodajanju podnapisov:\n{self._opis_napake_procesa(e)}",
             )
 
     def _pretvori(self):
@@ -3013,15 +3421,19 @@ class BaMKV:
 
             ukaz.append(ciljna_pot)
 
-            subprocess.run(ukaz, check=True, capture_output=True)
+            self._izvedi_ukaz_z_osvezevanjem(ukaz)
             self._nastavi_prosto("Pretvorba končana.")
             messagebox.showinfo(
                 "Uspeh", f"Pretvorba uspešna!\n\nShranjeno v:\n{ciljna_pot}"
             )
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, OperacijaPrekinjena, OSError) as e:
+            if self._zapiranje:
+                self._nastavi_prosto("Operacija prekinjena.")
+                return
             self._nastavi_prosto("Napaka pri pretvorbi.")
             messagebox.showerror(
-                "Napaka", f"Napaka pri pretvorbi:\n{e.stderr.decode()}"
+                "Napaka",
+                f"Napaka pri pretvorbi:\n{self._opis_napake_procesa(e)}",
             )
 
     def _odstrani_sledi(self):
@@ -3074,15 +3486,19 @@ class BaMKV:
 
             ukaz.extend(["-c", "copy", ciljna_pot])
 
-            subprocess.run(ukaz, check=True, capture_output=True)
+            self._izvedi_ukaz_z_osvezevanjem(ukaz)
             self._nastavi_prosto("Sledi odstranjene.")
             messagebox.showinfo(
                 "Uspeh", f"Sledi uspešno odstranjene!\n\nShranjeno v:\n{ciljna_pot}"
             )
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, OperacijaPrekinjena, OSError) as e:
+            if self._zapiranje:
+                self._nastavi_prosto("Operacija prekinjena.")
+                return
             self._nastavi_prosto("Napaka pri odstranjevanju.")
             messagebox.showerror(
-                "Napaka", f"Napaka pri odstranjevanju:\n{e.stderr.decode()}"
+                "Napaka",
+                f"Napaka pri odstranjevanju:\n{self._opis_napake_procesa(e)}",
             )
 
 
@@ -3121,6 +3537,9 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
 
     if not mkvmerge:
         print("Napaka: mkvmerge ni nameščen.")
+        sys.exit(1)
+    if not ffmpeg or not ffprobe:
+        print("Napaka: za -q sta potrebna ffmpeg in ffprobe.")
         sys.exit(1)
 
     # Poišči video datoteke rekurzivno
@@ -3161,10 +3580,9 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
     neuspesne = 0
 
     # Jeziki, ki jih štejemo kot "naše" podnapise (prioriteta: slv > hrv > srp > bos)
-    nasi_jeziki = ["slv", "slo", "sl", "hrv", "hr", "srp", "sr", "bos", "bs"]
+    nasi_jeziki = ["slv", "sl", "hrv", "hr", "srp", "sr", "bos", "bs"]
     prioriteta_jezikov = {
         "slv": 0,
-        "slo": 0,
         "sl": 0,
         "hrv": 1,
         "hr": 1,
@@ -3429,6 +3847,118 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
                 os.remove(zacasna_pot)
             return False
 
+    def je_srbska_latinica(sled):
+        """Ali subtitle sled nedvoumno označuje srbsko latinico."""
+        oznake = sled.get("tags", {})
+        jezik = oznake.get("language", "").lower().replace("_", "-")
+        naslov = oznake.get("title", "").lower()
+        return (
+            jezik in {"sr-latn", "srp-latn", "sr-latin", "srp-latin"}
+            or "latin" in naslov
+            or "latinica" in naslov
+        )
+
+    def izberi_podnapis(sledi):
+        """Vrne (relativni indeks, jezik) za edini ohranjeni podnapis."""
+        kandidati = []
+        sub_indeks = 0
+        for sled in sledi:
+            if sled.get("codec_type") != "subtitle":
+                continue
+            jezik = sled.get("tags", {}).get("language", "").lower()
+            if jezik in {"slv", "sl"}:
+                kandidati.append((0, sub_indeks, jezik))
+            elif jezik in {"hrv", "hr"}:
+                kandidati.append((1, sub_indeks, jezik))
+            elif jezik in {"bos", "bs"}:
+                kandidati.append((2, sub_indeks, jezik))
+            elif je_srbska_latinica(sled):
+                kandidati.append((3, sub_indeks, jezik or "srp-Latn"))
+            sub_indeks += 1
+        if not kandidati:
+            return None, None
+        _, indeks, jezik = min(kandidati)
+        return indeks, jezik
+
+    def pridobi_sledi(pot):
+        if not ffprobe:
+            raise RuntimeError("ffprobe ni nameščen; -q ne more varno izbrati sledi.")
+        ukaz = (
+            ffprobe.split()
+            if "flatpak run" in ffprobe
+            else [ffprobe]
+        ) + ["-v", "error", "-print_format", "json", "-show_streams", pot]
+        rezultat = subprocess.run(ukaz, capture_output=True, text=True, check=True)
+        return json.loads(rezultat.stdout).get("streams", [])
+
+    def obdelaj_mkv_po_pravilih(mkv_pot, srt_pot, izbrisi_izvorne):
+        """Ohrani video, en angleški zvok in en prednostni podnapis."""
+        try:
+            sledi = pridobi_sledi(mkv_pot)
+            audio_kodek, _, audio_relativni = izberi_audio_sled(sledi)
+            if audio_relativni is None:
+                raise RuntimeError("MKV nima zvočne sledi.")
+
+            # Zunanji SRT je slovenski in ima zato prednost pred vdelanimi sledmi.
+            sub_relativni, sub_jezik = izberi_podnapis(sledi)
+            uporabi_zunanji_srt = bool(srt_pot)
+            if uporabi_zunanji_srt:
+                sub_relativni, sub_jezik = None, "slv"
+
+            pretvori_audio = audio_kodek and audio_kodek.lower() != "ac3"
+            ciljna_pot = mkv_pot if izbrisi_izvorne else edinstvena_bac_pot(mkv_pot)
+            zacasna_pot = str(
+                Path(ciljna_pot).with_name(f".{Path(ciljna_pot).stem}.bac.tmp.mkv")
+            )
+            print(f"Obdelujem: {Path(mkv_pot).name}")
+            print("  + video kopiram brez pretvarjanja")
+            print(
+                "  + zvok: angleški" if je_angleski_audio(
+                    [sled for sled in sledi if sled.get("codec_type") == "audio"][audio_relativni]
+                ) else "  + angleškega zvoka ni; ohranjam prvo zvočno sled"
+            )
+            if pretvori_audio:
+                print(f"  + pretvarjam zvok ({audio_kodek} → AC3)")
+            if uporabi_zunanji_srt:
+                print(f"  + ohranjam slovenske podnapise: {Path(srt_pot).name}")
+            elif sub_relativni is not None:
+                print(f"  + ohranjam podnapise: {sub_jezik}")
+            else:
+                print("  + odstranjujem vse podnapise (ni slv/hrv/bos/srbskih latinica)")
+
+            ukaz = (ffmpeg.split() if "flatpak run" in ffmpeg else [ffmpeg])
+            ukaz.extend(["-y", "-i", mkv_pot])
+            if uporabi_zunanji_srt:
+                ukaz.extend(["-i", srt_pot])
+            ukaz.extend(["-map", "0:v?", "-map", f"0:a:{audio_relativni}"])
+            if uporabi_zunanji_srt:
+                ukaz.extend(["-map", "1:0", "-metadata:s:s:0", "language=slv"])
+            elif sub_relativni is not None:
+                ukaz.extend(["-map", f"0:s:{sub_relativni}"])
+            # Ohrani tudi priponke in podatkovne sledi, brez vključitve drugih podnapisov.
+            ukaz.extend(["-map", "0:t?", "-map", "0:d?", "-c:v", "copy", "-c:s", "copy"])
+            if pretvori_audio:
+                ukaz.extend(["-c:a", "ac3", "-b:a", "192k"])
+            else:
+                ukaz.extend(["-c:a", "copy"])
+            ukaz.extend(["-disposition:a:0", "default"])
+            if uporabi_zunanji_srt or sub_relativni is not None:
+                ukaz.extend(["-disposition:s:0", "default"])
+            ukaz.append(zacasna_pot)
+            subprocess.run(ukaz, check=True, capture_output=True)
+
+            os.replace(zacasna_pot, ciljna_pot)
+            print(f"  ✓ {'Posodobljen' if izbrisi_izvorne else 'Ustvarjen'}: {Path(ciljna_pot).name}")
+            if izbrisi_izvorne and srt_pot:
+                os.remove(srt_pot)
+                print(f"  ✗ Izbrisan: {Path(srt_pot).name}")
+            return True
+        except (RuntimeError, subprocess.CalledProcessError, OSError) as e:
+            print(f"  ✗ Napaka: {str(e)[:300]}")
+            if "zacasna_pot" in locals() and os.path.exists(zacasna_pot):
+                os.remove(zacasna_pot)
+            return False
+
     # Najprej obdelaj obstoječe MKV datoteke
     for mkv_pot in mkv_datoteke:
         osnovni_ime = Path(mkv_pot).stem
@@ -3454,7 +3984,7 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
                         srt_pot = os.path.join(video_dir, datoteka)
                         break
 
-        if obdelaj_obstojeci_mkv(mkv_pot, srt_pot, izbrisi_izvorne):
+        if obdelaj_mkv_po_pravilih(mkv_pot, srt_pot, izbrisi_izvorne):
             uspesne += 1
         else:
             neuspesne += 1
@@ -3623,8 +4153,8 @@ def main():
 Primeri:
   bac           Zaženi grafični vmesnik
   bac film.mkv  Zaženi grafični vmesnik in odpri datoteko
-  bac -q        Hitro združi vse video+srt v MKV
-  bac -qq       Kot -q, ampak izbriše izvorne datoteke
+  bac -q        Uredi MKV: en zvok in en prednostni podnapis
+  bac -qq       Kot -q, ampak zamenja izvorne datoteke
         """,
         add_help=False,
     )
@@ -3643,7 +4173,7 @@ Primeri:
         "--quick",
         action="count",
         default=0,
-        help="Hitro združi video+srt v MKV (-q ohrani, -qq izbriše izvorne)",
+        help="Uredi MKV (-q ustvari _bac, -qq zamenja izvorno datoteko)",
     )
     tema_skupina = parser.add_mutually_exclusive_group()
     tema_skupina.add_argument(
@@ -3671,12 +4201,8 @@ Primeri:
         elif args.dark:
             prisiljena_tema = "temna"
 
-        try:
-            from tkinterdnd2 import TkinterDnD
-
-            root = TkinterDnD.Tk()
-        except ImportError:
-            root = tk.Tk()
+        tkinter_dnd = _pripravi_tkinterdnd2()
+        root = tkinter_dnd.Tk() if tkinter_dnd is not None else tk.Tk()
 
         app = BaMKV(root, prisiljena_tema=prisiljena_tema, zacetne_datoteke=args.datoteke)
         root.mainloop()
