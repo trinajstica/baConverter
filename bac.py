@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
@@ -1158,7 +1159,7 @@ class BaMKV:
         self.napredek.pack(side="right", padx=(10, 0))
         self.napredek.start(10)
         self.root.config(cursor="watch")
-        self.root.update()
+        self.root.update_idletasks()
 
     def _nastavi_prosto(self, sporocilo="Pripravljeno"):
         """Nastavi aplikacijo nazaj v prosto stanje."""
@@ -1174,11 +1175,11 @@ class BaMKV:
         self.status.config(text=sporocilo)
         if self._zapiranje:
             # Zapiranje odložimo do izhoda iz trenutnega callbacka; sicer bi
-            # root.destroy() znotraj root.update() prekinil tekoči ukaz GUI-ja.
+            # root.destroy() znotraj GUI callbacka prekinil tekoči ukaz.
             self.root.after(50, self.root.destroy)
             return
         self._odkleni_gui()
-        self.root.update()
+        self.root.update_idletasks()
 
     def _sprehodi_widgete(self, widget):
         """Vrne vse podrejene widgete, tudi v ugnezdenih okvirjih."""
@@ -1327,43 +1328,75 @@ class BaMKV:
 
     def _izvedi_proces_z_datotekama(self, ukaz, stdout_dat, stderr_dat):
         """Izvede proces z izhodom v datotekah, ki se ne moreta napolniti."""
-        proces = subprocess.Popen(
-            ukaz,
-            stdout=stdout_dat,
-            stderr=stderr_dat,
-            start_new_session=True,
-        )
-        self._trenutni_proces = proces
-        try:
-            if self._zapiranje:
-                self._ubij_trenutni_proces()
-            while proces.poll() is None:
-                self.root.update_idletasks()
-                self.root.update()
+        rezultat = {}
+        koncano = threading.Event()
+
+        def izvajaj():
+            proces = None
+            try:
+                proces = subprocess.Popen(
+                    ukaz,
+                    stdout=stdout_dat,
+                    stderr=stderr_dat,
+                    start_new_session=True,
+                )
+                self._trenutni_proces = proces
                 if self._zapiranje:
                     self._ubij_trenutni_proces()
-                    break
-                time.sleep(0.05)
 
-            if self._zapiranje:
-                try:
-                    proces.wait(timeout=3)
-                except subprocess.TimeoutExpired:
+                while proces.poll() is None:
+                    if self._zapiranje:
+                        self._ubij_trenutni_proces()
+                        break
+                    time.sleep(0.05)
+
+                if self._zapiranje:
                     try:
-                        os.killpg(os.getpgid(proces.pid), signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError, OSError):
-                        proces.kill()
+                        proces.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(os.getpgid(proces.pid), signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            proces.kill()
+                        proces.wait()
+                else:
                     proces.wait()
-            else:
-                proces.wait()
-            stdout_dat.seek(0)
-            stderr_dat.seek(0)
-            stdout = stdout_dat.read()
-            stderr = stderr_dat.read()
-        finally:
-            self._trenutni_proces = None
 
-        return proces.returncode, stdout, stderr
+                stdout_dat.seek(0)
+                stderr_dat.seek(0)
+                rezultat["povratna_koda"] = proces.returncode
+                rezultat["stdout"] = stdout_dat.read()
+                rezultat["stderr"] = stderr_dat.read()
+            except BaseException as napaka:
+                rezultat["napaka"] = napaka
+            finally:
+                self._trenutni_proces = None
+                koncano.set()
+
+        nit = threading.Thread(target=izvajaj, daemon=True)
+        nit.start()
+
+        # Tkinter ostane odziven, vendar ne uporabljamo nevarnega root.update(),
+        # ki lahko ponovno vstopi v poljubne GUI callbacke.
+        signal_koncano = tk.BooleanVar(self.root, value=False)
+
+        def preveri_konec():
+            if koncano.is_set():
+                signal_koncano.set(True)
+            else:
+                self.root.after(50, preveri_konec)
+
+        self.root.after(0, preveri_konec)
+        self.root.wait_variable(signal_koncano)
+        nit.join()
+
+        if "napaka" in rezultat:
+            raise rezultat["napaka"]
+        return (
+            rezultat["povratna_koda"],
+            rezultat["stdout"],
+            rezultat["stderr"],
+        )
 
     @staticmethod
     def _opis_napake_procesa(napaka):
@@ -1398,34 +1431,40 @@ class BaMKV:
         except OSError:
             pass
 
+    def _preveri_zapisljivost_cilja(self, ciljna_pot):
+        """Preveri, ali lahko cilj ustvarimo oziroma prepišemo."""
+        cilj = Path(ciljna_pot).expanduser()
+        mapa = cilj.parent
+        try:
+            if not mapa.is_dir():
+                raise OSError(f"Ciljna mapa ne obstaja: {mapa}")
+            if hasattr(os, "ST_RDONLY") and os.statvfs(mapa).f_flag & os.ST_RDONLY:
+                raise OSError(f"Ciljna mapa je samo za branje: {mapa}")
+            if not os.access(mapa, os.W_OK | os.X_OK):
+                raise OSError(f"V ciljni mapi ni dovoljenja za pisanje: {mapa}")
+            if cilj.exists() and not os.access(cilj, os.W_OK):
+                raise OSError(f"V ciljno datoteko ni dovoljenja za pisanje: {cilj}")
+        except OSError as napaka:
+            messagebox.showerror(
+                "Cilj ni zapisljiv",
+                f"Datoteke ni mogoče shraniti.\n\n{napaka}\n\n"
+                "Izberite drugo mapo ali odklopite USB pravilno, da bo zapisljiv.",
+            )
+            return False
+
+        if cilj.exists() and not messagebox.askyesno(
+            "Prepiši datoteko?",
+            f"Datoteka že obstaja:\n\n{cilj}\n\nJo želite prepisati?",
+        ):
+            return False
+        return True
+
     def _poisci_orodje(self, ime):
         """Poišče orodje v sistemu, vključno s flatpak paketi."""
         # Najprej preveri sistemsko pot
         pot = shutil.which(ime)
         if pot:
             return pot
-
-        # Preveri flatpak
-        flatpak_poti = {
-            "ffmpeg": [
-                "/var/lib/flatpak/exports/bin/org.ffmpeg.FFmpeg",
-                os.path.expanduser(
-                    "~/.local/share/flatpak/exports/bin/org.ffmpeg.FFmpeg"
-                ),
-            ],
-            "ffprobe": [
-                "/var/lib/flatpak/exports/bin/org.ffmpeg.FFmpeg",  # ffprobe je del ffmpeg
-                os.path.expanduser(
-                    "~/.local/share/flatpak/exports/bin/org.ffmpeg.FFmpeg"
-                ),
-            ],
-            "mkvmerge": [
-                "/var/lib/flatpak/exports/bin/org.bunkus.mkvtoolnix-gui",
-                os.path.expanduser(
-                    "~/.local/share/flatpak/exports/bin/org.bunkus.mkvtoolnix-gui"
-                ),
-            ],
-        }
 
         # Poišči v flatpak aplikacijah
         try:
@@ -1961,10 +2000,14 @@ class BaMKV:
         if not ciljna_pot.endswith(".mkv"):
             ciljna_pot += ".mkv"
 
+        if not self._preveri_zapisljivost_cilja(ciljna_pot):
+            return
+
         self.gumb_izvedi.config(state="disabled")
         self._nastavi_zasedeno("Izvajam operacije...")
         self._nastavi_napredek_operacij(None, "Pripravljam operacije …")
         zacasna_pot = None
+        izhodna_zacasna_pot = None
 
         try:
             # Zberi podatke za mkvmerge
@@ -2011,6 +2054,30 @@ class BaMKV:
                 for op in self.cakalne_operacije
             )
 
+            potrebujejo_track_id = bool(
+                sledi_za_odstranitev
+                or spremembe_jezika
+                or spremembe_naslova
+                or any(privzete_sledi.values())
+            )
+            mkv_track_map = {}
+            if potrebujejo_track_id:
+                mkv_track_map = self._pridobi_mkvmerge_track_map(
+                    self.mkv_pot, self._pridobi_informacije()
+                )
+                if not mkv_track_map:
+                    raise RuntimeError(
+                        "Ni mogoče zanesljivo preslikati track ID-jev za mkvmerge."
+                    )
+
+            def mkv_track_id(ffprobe_id):
+                try:
+                    return mkv_track_map[str(ffprobe_id)]
+                except KeyError as napaka:
+                    raise RuntimeError(
+                        f"Sledi {ffprobe_id} ni mogoče najti v mkvmerge."
+                    ) from napaka
+
             # Če je potrebna pretvorba zvoka, najprej uporabi ffmpeg
             vhodna_datoteka = self.mkv_pot
 
@@ -2018,7 +2085,10 @@ class BaMKV:
                 self._nastavi_zasedeno("Pretvarjam izbrane sledi...")
                 self._nastavi_napredek_operacij(None, "Pretvarjam izbrane sledi …")
                 if samo_pretvorbe:
-                    izhod_pretvorbe = ciljna_pot
+                    izhodna_zacasna_pot = self._nova_zacasna_mkv_pot(
+                        ciljna_pot, "output"
+                    )
+                    izhod_pretvorbe = izhodna_zacasna_pot
                 else:
                     zacasna_pot = self._nova_zacasna_mkv_pot(
                         ciljna_pot, "temp_tracks"
@@ -2056,6 +2126,8 @@ class BaMKV:
                 # Če seznam vsebuje samo pretvorbe, je rezultat ffmpeg že
                 # končni MKV. Drugi celoten prepis z mkvmerge ni potreben.
                 if samo_pretvorbe:
+                    os.replace(izhodna_zacasna_pot, ciljna_pot)
+                    izhodna_zacasna_pot = None
                     self._pocisti_operacije()
                     self._nastavi_napredek_operacij(100, "Končano")
                     self._nastavi_prosto("Operacije uspešno izvedene.")
@@ -2067,30 +2139,33 @@ class BaMKV:
 
             self._nastavi_zasedeno("Združujem s pomočjo mkvmerge...")
             self._nastavi_napredek_operacij(None, "Združujem datoteke …")
+            izhodna_zacasna_pot = self._nova_zacasna_mkv_pot(
+                ciljna_pot, "output"
+            )
 
             # Pripravi mkvmerge ukaz
             if "flatpak run" in self.mkvmerge:
-                ukaz = self.mkvmerge.split() + ["-o", ciljna_pot]
+                ukaz = self.mkvmerge.split() + ["-o", izhodna_zacasna_pot]
             else:
-                ukaz = [self.mkvmerge, "-o", ciljna_pot]
+                ukaz = [self.mkvmerge, "-o", izhodna_zacasna_pot]
 
             # Sledi za odstranitev
             if sledi_za_odstranitev:
                 vse_sledi = self._pridobi_informacije()
                 video_sledi = [
-                    str(s["index"])
+                    mkv_track_id(s["index"])
                     for s in vse_sledi
                     if s.get("codec_type") == "video"
                     and str(s["index"]) not in sledi_za_odstranitev
                 ]
                 audio_sledi = [
-                    str(s["index"])
+                    mkv_track_id(s["index"])
                     for s in vse_sledi
                     if s.get("codec_type") == "audio"
                     and str(s["index"]) not in sledi_za_odstranitev
                 ]
                 sub_sledi = [
-                    str(s["index"])
+                    mkv_track_id(s["index"])
                     for s in vse_sledi
                     if s.get("codec_type") == "subtitle"
                     and str(s["index"]) not in sledi_za_odstranitev
@@ -2111,16 +2186,16 @@ class BaMKV:
 
             # Spremembe jezika
             for stevilka, jezik in spremembe_jezika.items():
-                ukaz.extend(["--language", f"{stevilka}:{jezik}"])
+                ukaz.extend(["--language", f"{mkv_track_id(stevilka)}:{jezik}"])
 
             # Spremembe naslova
             for stevilka, naslov in spremembe_naslova.items():
-                ukaz.extend(["--track-name", f"{stevilka}:{naslov}"])
+                ukaz.extend(["--track-name", f"{mkv_track_id(stevilka)}:{naslov}"])
 
             # Privzete sledi
             for vrsta, stevilka in privzete_sledi.items():
                 if stevilka:
-                    ukaz.extend(["--default-track", f"{stevilka}:yes"])
+                    ukaz.extend(["--default-track", f"{mkv_track_id(stevilka)}:yes"])
 
             if zamenjaj_vse_podnapise:
                 ukaz.extend(["--no-subtitles"])
@@ -2138,6 +2213,8 @@ class BaMKV:
 
             # Počisti začasne datoteke
             self._nastavi_napredek_operacij(None, "Zaključujem …")
+            os.replace(izhodna_zacasna_pot, ciljna_pot)
+            izhodna_zacasna_pot = None
             self._varno_odstrani(zacasna_pot)
 
             self._pocisti_operacije()
@@ -2148,7 +2225,12 @@ class BaMKV:
                 f"Vse operacije uspešno izvedene!\n\nShranjeno v:\n{ciljna_pot}",
             )
 
-        except (subprocess.CalledProcessError, OperacijaPrekinjena, OSError) as e:
+        except (
+            subprocess.CalledProcessError,
+            OperacijaPrekinjena,
+            OSError,
+            RuntimeError,
+        ) as e:
             if self._zapiranje:
                 self._nastavi_prosto("Operacija prekinjena.")
                 return
@@ -2157,6 +2239,7 @@ class BaMKV:
             messagebox.showerror("Napaka", f"Napaka pri izvajanju operacij:\n{napaka}")
         finally:
             self._varno_odstrani(zacasna_pot)
+            self._varno_odstrani(izhodna_zacasna_pot)
 
     def _ustvari_podnapisi(self, okvir):
         """Ustvari zavihek za dodajanje podnapisov."""
@@ -2506,13 +2589,20 @@ class BaMKV:
         if not ciljna_pot.endswith(".mkv"):
             ciljna_pot += ".mkv"
 
+        if not self._preveri_zapisljivost_cilja(ciljna_pot):
+            return
+
         self._nastavi_zasedeno("Ustvarjam MKV...")
+        izhodna_zacasna_pot = None
 
         try:
+            izhodna_zacasna_pot = self._nova_zacasna_mkv_pot(
+                ciljna_pot, "output"
+            )
             if "flatpak run" in self.mkvmerge:
-                ukaz = self.mkvmerge.split() + ["-o", ciljna_pot]
+                ukaz = self.mkvmerge.split() + ["-o", izhodna_zacasna_pot]
             else:
-                ukaz = [self.mkvmerge, "-o", ciljna_pot]
+                ukaz = [self.mkvmerge, "-o", izhodna_zacasna_pot]
 
             # Naslov
             naslov = self.mkv_naslov.get()
@@ -2530,6 +2620,8 @@ class BaMKV:
                 ukaz.append(pot)
 
             self._izvedi_ukaz_z_osvezevanjem(ukaz)
+            os.replace(izhodna_zacasna_pot, ciljna_pot)
+            izhodna_zacasna_pot = None
             self._nastavi_prosto("MKV ustvarjen.")
             messagebox.showinfo(
                 "Uspeh", f"MKV uspešno ustvarjen!\n\nShranjeno v:\n{ciljna_pot}"
@@ -2541,6 +2633,8 @@ class BaMKV:
             napaka = self._opis_napake_procesa(e)
             self._nastavi_prosto("Napaka pri ustvarjanju.")
             messagebox.showerror("Napaka", f"Napaka pri ustvarjanju MKV:\n{napaka}")
+        finally:
+            self._varno_odstrani(izhodna_zacasna_pot)
 
     def _ustvari_navodila(self, okvir):
         """Ustvari zavihek z navodili za uporabo."""
@@ -3036,13 +3130,25 @@ class BaMKV:
         if not ciljna_pot.endswith(".mkv"):
             ciljna_pot += ".mkv"
 
+        if not self._preveri_zapisljivost_cilja(ciljna_pot):
+            return
+
         self._nastavi_zasedeno("Pretvarjam v MKV...")
         zacasna_pot = None
+        izhodna_zacasna_pot = None
 
         try:
             # Preveri audio kodek in indeks prvega audio streama
             video_pot = next(d["pot"] for d in izbrane if d["vrsta"] == "Video")
             audio_kodek, prvi_audio_id = self._pridobi_audio_podatke(video_pot)
+            mkv_audio_id = None
+            if self.hitro_samo_prvi_zvok.get() and prvi_audio_id is not None:
+                mkv_track_map = self._pridobi_mkvmerge_track_map(video_pot)
+                mkv_audio_id = mkv_track_map.get(str(prvi_audio_id))
+                if mkv_audio_id is None:
+                    raise RuntimeError(
+                        "Izbrane zvočne sledi ni mogoče zanesljivo najti v mkvmerge."
+                    )
             potrebna_pretvorba_audio = (
                 self.hitro_aac.get()
                 and audio_kodek
@@ -3088,10 +3194,13 @@ class BaMKV:
             self._nastavi_zasedeno("Združujem v MKV...")
 
             # Združi z mkvmerge
+            izhodna_zacasna_pot = self._nova_zacasna_mkv_pot(
+                ciljna_pot, "output"
+            )
             if "flatpak run" in self.mkvmerge:
-                ukaz = self.mkvmerge.split() + ["-o", ciljna_pot]
+                ukaz = self.mkvmerge.split() + ["-o", izhodna_zacasna_pot]
             else:
-                ukaz = [self.mkvmerge, "-o", ciljna_pot]
+                ukaz = [self.mkvmerge, "-o", izhodna_zacasna_pot]
 
             # Dodaj datoteke
             for dat in izbrane:
@@ -3101,9 +3210,9 @@ class BaMKV:
                     if (
                         self.hitro_samo_prvi_zvok.get()
                         and not potrebna_pretvorba_audio
-                        and prvi_audio_id is not None
+                        and mkv_audio_id is not None
                     ):
-                        ukaz.extend(["--audio-tracks", str(prvi_audio_id)])
+                        ukaz.extend(["--audio-tracks", str(mkv_audio_id)])
                 elif dat["vrsta"] == "Podnapisi":
                     if jezik:
                         ukaz.extend(["--language", f"0:{jezik}"])
@@ -3113,6 +3222,8 @@ class BaMKV:
                 ukaz.append(dat["pot"])
 
             self._izvedi_ukaz_z_osvezevanjem(ukaz)
+            os.replace(izhodna_zacasna_pot, ciljna_pot)
+            izhodna_zacasna_pot = None
 
             # Počisti začasne datoteke
             self._varno_odstrani(zacasna_pot)
@@ -3121,7 +3232,12 @@ class BaMKV:
             messagebox.showinfo(
                 "Uspeh", f"MKV uspešno ustvarjen!\n\nShranjeno v:\n{ciljna_pot}"
             )
-        except (subprocess.CalledProcessError, OperacijaPrekinjena, OSError) as e:
+        except (
+            subprocess.CalledProcessError,
+            OperacijaPrekinjena,
+            OSError,
+            RuntimeError,
+        ) as e:
             if self._zapiranje:
                 self._nastavi_prosto("Operacija prekinjena.")
                 return
@@ -3130,6 +3246,7 @@ class BaMKV:
             messagebox.showerror("Napaka", f"Napaka pri pretvorbi:\n{napaka}")
         finally:
             self._varno_odstrani(zacasna_pot)
+            self._varno_odstrani(izhodna_zacasna_pot)
 
     def _odpri_mkv(self):
         """Odpre dialog za izbiro MKV datoteke."""
@@ -3144,13 +3261,82 @@ class BaMKV:
             self._osvezi_odstranitev()
             self.status.config(text=f"Odprto: {Path(pot).name}")
 
-    def _zaženi_ukaz(self, ukaz):
-        """Zažene ukaz, podpira tudi flatpak ukaze."""
-        if isinstance(ukaz, list) and ukaz and "flatpak run" in str(ukaz[0]):
-            # Flatpak ukaz - razbij prvi element
-            flatpak_deli = ukaz[0].split()
-            return flatpak_deli + ukaz[1:]
-        return ukaz
+    def _ukaz_orodja(self, orodje, *argumenti):
+        """Sestavi ukaz kot seznam argumentov, tudi za Flatpak orodja."""
+        if isinstance(orodje, str) and orodje.startswith("flatpak run "):
+            osnovni = orodje.split()
+        else:
+            osnovni = [orodje]
+        return osnovni + list(argumenti)
+
+    def _pridobi_sledi_za_pot(self, pot):
+        """Prebere FFprobe sledi za poljubno pot."""
+        if not self.ffprobe:
+            return []
+        ukaz = self._ukaz_orodja(
+            self.ffprobe,
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_streams",
+            pot,
+        )
+        if self._gui_zaklenjen:
+            stdout, _ = self._izvedi_ukaz_z_osvezevanjem(ukaz)
+            podatki = json.loads(stdout.decode())
+        else:
+            rezultat = subprocess.run(ukaz, capture_output=True, text=True, check=True)
+            podatki = json.loads(rezultat.stdout)
+        return podatki.get("streams", [])
+
+    def _pridobi_mkvmerge_track_map(self, pot, ffprobe_sledi=None):
+        """Preslika FFprobe stream indekse v mkvmerge track ID-je.
+
+        FFprobe indeksi so globalni stream indeksi, mkvmerge pa uporablja
+        track ID-je, ki so ločeni po posameznem vhodu. Preslikava temelji na
+        vrstnem redu sledi znotraj iste vrste (video, audio, subtitles).
+        """
+        if not self.mkvmerge:
+            return {}
+
+        ffprobe_sledi = (
+            self._pridobi_sledi_za_pot(pot)
+            if ffprobe_sledi is None
+            else ffprobe_sledi
+        )
+        ukaz = self._ukaz_orodja(self.mkvmerge, "-J", pot)
+        if self._gui_zaklenjen:
+            stdout, _ = self._izvedi_ukaz_z_osvezevanjem(ukaz)
+            podatki = json.loads(stdout.decode())
+        else:
+            rezultat = subprocess.run(ukaz, capture_output=True, text=True, check=True)
+            podatki = json.loads(rezultat.stdout)
+
+        vrsta_mkvmerge = {
+            "video": "video",
+            "audio": "audio",
+            "subtitles": "subtitle",
+        }
+        mkvmerge_po_vrsti = {"video": [], "audio": [], "subtitle": []}
+        for sled in podatki.get("tracks", []):
+            vrsta = vrsta_mkvmerge.get(sled.get("type"))
+            if vrsta in mkvmerge_po_vrsti:
+                mkvmerge_po_vrsti[vrsta].append(str(sled["id"]))
+
+        ffprobe_po_vrsti = {"video": [], "audio": [], "subtitle": []}
+        for sled in ffprobe_sledi:
+            vrsta = sled.get("codec_type")
+            if vrsta in ffprobe_po_vrsti:
+                ffprobe_po_vrsti[vrsta].append(str(sled["index"]))
+
+        preslikava = {}
+        for vrsta in ffprobe_po_vrsti:
+            for ffprobe_id, mkvmerge_id in zip(
+                ffprobe_po_vrsti[vrsta], mkvmerge_po_vrsti[vrsta]
+            ):
+                preslikava[ffprobe_id] = mkvmerge_id
+        return preslikava
 
     def _pridobi_informacije(self, prisilno=False):
         """Pridobi informacije o sledeh v MKV datoteki."""
@@ -3307,6 +3493,12 @@ class BaMKV:
         if not ciljna_pot:
             return
 
+        if not ciljna_pot.endswith(".mkv"):
+            ciljna_pot += ".mkv"
+
+        if not self._preveri_zapisljivost_cilja(ciljna_pot):
+            return
+
         # Jezik
         jezik = (
             self.jezik_podnapis.get().split(" - ")[0]
@@ -3316,12 +3508,16 @@ class BaMKV:
         naslov = self.naslov_podnapis.get()
 
         self._nastavi_zasedeno("Dodajam podnapise...")
+        izhodna_zacasna_pot = None
 
         try:
+            izhodna_zacasna_pot = self._nova_zacasna_mkv_pot(
+                ciljna_pot, "output"
+            )
             if "flatpak run" in self.mkvmerge:
-                ukaz = self.mkvmerge.split() + ["-o", ciljna_pot]
+                ukaz = self.mkvmerge.split() + ["-o", izhodna_zacasna_pot]
             else:
-                ukaz = [self.mkvmerge, "-o", ciljna_pot]
+                ukaz = [self.mkvmerge, "-o", izhodna_zacasna_pot]
 
             if self.zamenjaj_podnapise.get():
                 ukaz.extend(["--no-subtitles"])
@@ -3337,6 +3533,8 @@ class BaMKV:
             ukaz.append(pot_podnapis)
 
             self._izvedi_ukaz_z_osvezevanjem(ukaz)
+            os.replace(izhodna_zacasna_pot, ciljna_pot)
+            izhodna_zacasna_pot = None
             self._nastavi_prosto("Podnapisi dodani.")
             messagebox.showinfo(
                 "Uspeh", f"Podnapisi uspešno dodani!\n\nShranjeno v:\n{ciljna_pot}"
@@ -3350,6 +3548,8 @@ class BaMKV:
                 "Napaka",
                 f"Napaka pri dodajanju podnapisov:\n{self._opis_napake_procesa(e)}",
             )
+        finally:
+            self._varno_odstrani(izhodna_zacasna_pot)
 
     def _pretvori(self):
         """Pretvori avdio/video sledi."""
@@ -3374,7 +3574,14 @@ class BaMKV:
         if not ciljna_pot:
             return
 
+        if not ciljna_pot.endswith(".mkv"):
+            ciljna_pot += ".mkv"
+
+        if not self._preveri_zapisljivost_cilja(ciljna_pot):
+            return
+
         self._nastavi_zasedeno("Pretvarjam...")
+        izhodna_zacasna_pot = None
 
         try:
             if "flatpak run" in self.ffmpeg:
@@ -3419,9 +3626,14 @@ class BaMKV:
             # Kopiraj podnapise
             ukaz.extend(["-c:s", "copy"])
 
-            ukaz.append(ciljna_pot)
+            izhodna_zacasna_pot = self._nova_zacasna_mkv_pot(
+                ciljna_pot, "output"
+            )
+            ukaz.append(izhodna_zacasna_pot)
 
             self._izvedi_ukaz_z_osvezevanjem(ukaz)
+            os.replace(izhodna_zacasna_pot, ciljna_pot)
+            izhodna_zacasna_pot = None
             self._nastavi_prosto("Pretvorba končana.")
             messagebox.showinfo(
                 "Uspeh", f"Pretvorba uspešna!\n\nShranjeno v:\n{ciljna_pot}"
@@ -3435,6 +3647,8 @@ class BaMKV:
                 "Napaka",
                 f"Napaka pri pretvorbi:\n{self._opis_napake_procesa(e)}",
             )
+        finally:
+            self._varno_odstrani(izhodna_zacasna_pot)
 
     def _odstrani_sledi(self):
         """Odstrani označene sledi."""
@@ -3452,6 +3666,10 @@ class BaMKV:
             messagebox.showerror("Napaka", "ffmpeg ni nameščen.")
             return
 
+        if not self.ffprobe:
+            messagebox.showerror("Napaka", "ffprobe ni nameščen.")
+            return
+
         # Ciljna datoteka
         osnovni_dir = os.path.dirname(self.mkv_pot)
         osnovni_ime = Path(self.mkv_pot).stem
@@ -3465,7 +3683,14 @@ class BaMKV:
         if not ciljna_pot:
             return
 
+        if not ciljna_pot.endswith(".mkv"):
+            ciljna_pot += ".mkv"
+
+        if not self._preveri_zapisljivost_cilja(ciljna_pot):
+            return
+
         self._nastavi_zasedeno("Odstranjujem sledi...")
+        izhodna_zacasna_pot = None
 
         try:
             # Pridobi vse sledi
@@ -3475,6 +3700,8 @@ class BaMKV:
                 for s in vse_sledi
                 if str(s.get("index")) not in self.izbrane_za_odstranitev
             ]
+            if not ohrani:
+                raise RuntimeError("Vsaj ena sled mora ostati v izhodni datoteki.")
 
             if "flatpak run" in self.ffmpeg:
                 ukaz = self.ffmpeg.split() + ["-i", self.mkv_pot, "-y"]
@@ -3484,14 +3711,24 @@ class BaMKV:
             for stevilka in ohrani:
                 ukaz.extend(["-map", f"0:{stevilka}"])
 
-            ukaz.extend(["-c", "copy", ciljna_pot])
+            izhodna_zacasna_pot = self._nova_zacasna_mkv_pot(
+                ciljna_pot, "output"
+            )
+            ukaz.extend(["-c", "copy", izhodna_zacasna_pot])
 
             self._izvedi_ukaz_z_osvezevanjem(ukaz)
+            os.replace(izhodna_zacasna_pot, ciljna_pot)
+            izhodna_zacasna_pot = None
             self._nastavi_prosto("Sledi odstranjene.")
             messagebox.showinfo(
                 "Uspeh", f"Sledi uspešno odstranjene!\n\nShranjeno v:\n{ciljna_pot}"
             )
-        except (subprocess.CalledProcessError, OperacijaPrekinjena, OSError) as e:
+        except (
+            subprocess.CalledProcessError,
+            OperacijaPrekinjena,
+            OSError,
+            RuntimeError,
+        ) as e:
             if self._zapiranje:
                 self._nastavi_prosto("Operacija prekinjena.")
                 return
@@ -3500,6 +3737,8 @@ class BaMKV:
                 "Napaka",
                 f"Napaka pri odstranjevanju:\n{self._opis_napake_procesa(e)}",
             )
+        finally:
+            self._varno_odstrani(izhodna_zacasna_pot)
 
 
 def hitro_pretvorba_cli(izbrisi_izvorne=False):
@@ -3636,217 +3875,6 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
             stevec += 1
         return str(kandidat)
 
-    def preveri_mkv_sledi(mkv_pot):
-        """Preveri sledi v MKV datoteki in prednostno izbere angleško audio sled."""
-        if not ffprobe:
-            return None, None, False, None, 0, [], None, None
-        try:
-            if "flatpak run" in ffprobe:
-                deli = ffprobe.split()
-                ukaz = deli + [
-                    "-v",
-                    "quiet",
-                    "-print_format",
-                    "json",
-                    "-show_streams",
-                    mkv_pot,
-                ]
-            else:
-                ukaz = [
-                    ffprobe,
-                    "-v",
-                    "quiet",
-                    "-print_format",
-                    "json",
-                    "-show_streams",
-                    mkv_pot,
-                ]
-            rezultat = subprocess.run(ukaz, capture_output=True, text=True, check=True)
-            podatki = json.loads(rezultat.stdout)
-            sledi = podatki.get("streams", [])
-
-            ima_nase_podnapise = False
-            nasi_privzeti = False
-            najboljsi_podnapis = None  # (prioriteta, subtitle-relativen indeks)
-            sub_track_ids = []  # Globalni track ID-ji subtitle sledi (za mkvmerge)
-
-            sub_indeks = 0  # Šteje samo subtitle sledi
-            for sled in sledi:
-                if sled.get("codec_type") == "subtitle":
-                    jezik = sled.get("tags", {}).get("language", "").lower()
-                    disposition = sled.get("disposition", {})
-                    je_privzet = disposition.get("default", 0) == 1
-                    sub_track_ids.append(sled.get("index", sub_indeks))
-
-                    if jezik in nasi_jeziki:
-                        ima_nase_podnapise = True
-                        prio = prioriteta_jezikov.get(jezik, 99)
-
-                        if je_privzet:
-                            nasi_privzeti = True
-
-                        # Poišči najboljši podnapis po prioriteti
-                        if najboljsi_podnapis is None or prio < najboljsi_podnapis[0]:
-                            najboljsi_podnapis = (prio, sub_indeks)
-
-                    sub_indeks += 1
-
-            indeks_za_privzet = najboljsi_podnapis[1] if najboljsi_podnapis else None
-            audio_kodek, izbrani_audio, izbrani_audio_relativni = izberi_audio_sled(sledi)
-            return (
-                ima_nase_podnapise,
-                audio_kodek,
-                nasi_privzeti,
-                indeks_za_privzet,
-                sub_indeks,
-                sub_track_ids,
-                izbrani_audio,
-                izbrani_audio_relativni,
-            )
-        except Exception:
-            return None, None, False, None, 0, [], None, None
-
-    def obdelaj_obstojeci_mkv(mkv_pot, srt_pot, izbrisi_izvorne):
-        """Obdelaj obstoječo MKV datoteko - doda podnapise, pretvori audio če potrebno."""
-        osnovni_ime = Path(mkv_pot).stem
-
-        (
-            ima_nase_podnapise,
-            audio_kodek,
-            nasi_privzeti,
-            indeks_za_privzet,
-            sub_indeks,
-            sub_track_ids,
-            izbrani_audio_indeks,
-            izbrani_audio_relativni,
-        ) = preveri_mkv_sledi(mkv_pot)
-        sub_indeks = sub_indeks or 0
-        sub_track_ids = sub_track_ids or []
-
-        # Določi potrebne akcije
-        dodaj_podnapise = bool(srt_pot)
-        nastavi_privzete = (
-            ima_nase_podnapise and not nasi_privzeti and indeks_za_privzet is not None
-        )
-        pretvori_audio = audio_kodek and audio_kodek.lower() not in ["ac3"]
-
-        if not dodaj_podnapise and not nastavi_privzete and not pretvori_audio:
-            # MKV je že v redu
-            if srt_pot and izbrisi_izvorne:
-                # Podnapisi so že v MKV, lahko izbrišemo zunanje
-                os.remove(srt_pot)
-                print(f"  ✗ Izbrisan (že v MKV): {Path(srt_pot).name}")
-            return True
-
-        print(f"Obdelujem: {Path(mkv_pot).name}")
-        if dodaj_podnapise:
-            print(f"  + dodajam podnapise: {Path(srt_pot).name}")
-        if nastavi_privzete:
-            print(
-                f"  + nastavljam naše podnapise kot privzete (sled {indeks_za_privzet})"
-            )
-        if pretvori_audio:
-            print(f"  + pretvarjam zvok ({audio_kodek} → AC3)")
-
-        try:
-            ciljna_pot = mkv_pot if izbrisi_izvorne else edinstvena_bac_pot(mkv_pot)
-            zacasna_pot = ciljna_pot.replace(".mkv", "_temp_bac.mkv")
-
-            if pretvori_audio and ffmpeg:
-                # Uporabi ffmpeg za pretvorbo zvoka
-                # POMEMBNO: vsi -i argumenti morajo biti pred opcijami za izhod
-                if "flatpak run" in ffmpeg:
-                    ukaz_ff = ffmpeg.split() + ["-i", mkv_pot]
-                else:
-                    ukaz_ff = [ffmpeg, "-i", mkv_pot]
-
-                if dodaj_podnapise and srt_pot:
-                    # Drugi vhod mora biti pred opcijami za izhod
-                    ukaz_ff.extend(["-i", srt_pot])
-
-                ukaz_ff.append("-y")
-                ukaz_ff.extend(
-                    ["-c:v", "copy", "-c:a", "ac3", "-b:a", "192k", "-c:s", "copy"]
-                )
-
-                audio_map = (
-                    f"0:a:{izbrani_audio_relativni}"
-                    if izbrani_audio_relativni is not None
-                    else "0:a:0"
-                )
-                if dodaj_podnapise and srt_pot:
-                    # Samo prvi audio, brez obstoječih podnapisov, dodamo SRT kot privzet
-                    ukaz_ff.extend(["-map", "0:v", "-map", audio_map, "-map", "1:0"])
-                    ukaz_ff.extend(["-metadata:s:s:0", "language=slv"])
-                    ukaz_ff.extend(["-disposition:s:0", "default"])
-                else:
-                    ukaz_ff.extend(["-map", "0:v", "-map", audio_map, "-map", "0:s?"])
-                    if nastavi_privzete and indeks_za_privzet is not None:
-                        ukaz_ff.extend(
-                            [f"-disposition:s:{indeks_za_privzet}", "default"]
-                        )
-
-                ukaz_ff.append(zacasna_pot)
-                subprocess.run(ukaz_ff, check=True, capture_output=True)
-
-            elif (dodaj_podnapise or nastavi_privzete) and mkvmerge:
-                if "flatpak run" in mkvmerge:
-                    ukaz = mkvmerge.split() + ["-o", zacasna_pot]
-                else:
-                    ukaz = [mkvmerge, "-o", zacasna_pot]
-
-                if dodaj_podnapise:
-                    # Dodamo SRT - izpustimo vse ostale podnapise, ohranimo samo prvi audio
-                    if izbrani_audio_indeks is not None:
-                        ukaz.extend(["--audio-tracks", str(izbrani_audio_indeks)])
-                    ukaz.extend(["--no-subtitles"])
-                    ukaz.append(mkv_pot)
-                    ukaz.extend(
-                        ["--language", "0:slv", "--default-track-flag", "0:yes"]
-                    )
-                    ukaz.append(srt_pot)
-                else:
-                    # Samo nastavimo privzete sledi na obstoječih podnapisih
-                    for i in range(sub_indeks):
-                        track_id = sub_track_ids[i] if i < len(sub_track_ids) else i
-                        if i == indeks_za_privzet:
-                            ukaz.extend(["--default-track-flag", f"{track_id}:yes"])
-                        else:
-                            ukaz.extend(["--default-track-flag", f"{track_id}:no"])
-                    ukaz.append(mkv_pot)
-
-                subprocess.run(ukaz, check=True, capture_output=True)
-            else:
-                return False
-
-            if izbrisi_izvorne:
-                # Zamenjaj staro z novo
-                os.remove(mkv_pot)
-                os.rename(zacasna_pot, mkv_pot)
-                print(f"  ✓ Posodobljen: {Path(mkv_pot).name}")
-            else:
-                os.rename(zacasna_pot, ciljna_pot)
-                print(f"  ✓ Ustvarjen: {Path(ciljna_pot).name}")
-
-            # Izbriši SRT če je zahtevano
-            if srt_pot and izbrisi_izvorne:
-                os.remove(srt_pot)
-                print(f"  ✗ Izbrisan: {Path(srt_pot).name}")
-
-            return True
-
-        except subprocess.CalledProcessError as e:
-            napaka = (
-                e.stderr.decode()
-                if e.stderr
-                else (e.stdout.decode() if e.stdout else str(e))
-            )
-            print(f"  ✗ Napaka: {napaka[:300]}")
-            # Počisti morebitne začasne datoteke
-            if os.path.exists(zacasna_pot):
-                os.remove(zacasna_pot)
-            return False
-
     def je_srbska_latinica(sled):
         """Ali subtitle sled nedvoumno označuje srbsko latinico."""
         oznake = sled.get("tags", {})
@@ -3890,6 +3918,36 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
         ) + ["-v", "error", "-print_format", "json", "-show_streams", pot]
         rezultat = subprocess.run(ukaz, capture_output=True, text=True, check=True)
         return json.loads(rezultat.stdout).get("streams", [])
+
+    def pridobi_mkvmerge_track_map(pot, ffprobe_sledi):
+        """Preslika FFprobe stream indekse v mkvmerge track ID-je za CLI."""
+        ukaz = (
+            mkvmerge.split()
+            if "flatpak run" in mkvmerge
+            else [mkvmerge]
+        ) + ["-J", pot]
+        rezultat = subprocess.run(ukaz, capture_output=True, text=True, check=True)
+        podatki = json.loads(rezultat.stdout)
+        mkv_vrste = {"video": "video", "audio": "audio", "subtitles": "subtitle"}
+        mkv_po_vrsti = {"video": [], "audio": [], "subtitle": []}
+        for sled in podatki.get("tracks", []):
+            vrsta = mkv_vrste.get(sled.get("type"))
+            if vrsta in mkv_po_vrsti:
+                mkv_po_vrsti[vrsta].append(str(sled["id"]))
+
+        ff_po_vrsti = {"video": [], "audio": [], "subtitle": []}
+        for sled in ffprobe_sledi:
+            vrsta = sled.get("codec_type")
+            if vrsta in ff_po_vrsti:
+                ff_po_vrsti[vrsta].append(str(sled["index"]))
+
+        preslikava = {}
+        for vrsta in ff_po_vrsti:
+            for ffprobe_id, mkvmerge_id in zip(
+                ff_po_vrsti[vrsta], mkv_po_vrsti[vrsta]
+            ):
+                preslikava[ffprobe_id] = mkvmerge_id
+        return preslikava
 
     def obdelaj_mkv_po_pravilih(mkv_pot, srt_pot, izbrisi_izvorne):
         """Ohrani video, en angleški zvok in en prednostni podnapis."""
@@ -4028,6 +4086,7 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
             audio_kodek = None
             izbrani_audio_id = None
             izbrani_audio_relativni = None
+            ffprobe_sledi = []
             if ffprobe:
                 try:
                     if "flatpak run" in ffprobe:
@@ -4054,8 +4113,9 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
                         ukaz, capture_output=True, text=True, check=True
                     )
                     podatki = json.loads(rezultat.stdout)
+                    ffprobe_sledi = podatki.get("streams", [])
                     audio_kodek, izbrani_audio_id, izbrani_audio_relativni = (
-                        izberi_audio_sled(podatki.get("streams", []))
+                        izberi_audio_sled(ffprobe_sledi)
                     )
                 except Exception:
                     pass
@@ -4065,6 +4125,15 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
             ]
             vhodna_datoteka = video_pot
             zacasna_pot = None
+            izhodna_zacasna_pot = None
+            mkv_audio_id = None
+            if not potrebna_pretvorba_audio and izbrani_audio_id is not None:
+                mkv_audio_map = pridobi_mkvmerge_track_map(video_pot, ffprobe_sledi)
+                mkv_audio_id = mkv_audio_map.get(str(izbrani_audio_id))
+                if mkv_audio_id is None:
+                    raise RuntimeError(
+                        "Izbrane zvočne sledi ni mogoče zanesljivo najti v mkvmerge."
+                    )
 
             # Če je potrebna pretvorba zvoka
             if potrebna_pretvorba_audio and ffmpeg:
@@ -4090,14 +4159,21 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
                 vhodna_datoteka = zacasna_pot
 
             # Združi z mkvmerge
+            fd, izhodna_zacasna_pot = tempfile.mkstemp(
+                prefix=f".{Path(ciljna_pot).stem}.bac-output-",
+                suffix=".mkv",
+                dir=video_dir,
+            )
+            os.close(fd)
+            os.remove(izhodna_zacasna_pot)
             if "flatpak run" in mkvmerge:
-                ukaz = mkvmerge.split() + ["-o", ciljna_pot]
+                ukaz = mkvmerge.split() + ["-o", izhodna_zacasna_pot]
             else:
-                ukaz = [mkvmerge, "-o", ciljna_pot]
+                ukaz = [mkvmerge, "-o", izhodna_zacasna_pot]
 
             # Ohrani samo prvi audio track iz izvorne (če ni bil že pretvorjen)
-            if not potrebna_pretvorba_audio and izbrani_audio_id is not None:
-                ukaz.extend(["--audio-tracks", str(izbrani_audio_id)])
+            if not potrebna_pretvorba_audio and mkv_audio_id is not None:
+                ukaz.extend(["--audio-tracks", str(mkv_audio_id)])
             ukaz.append(vhodna_datoteka)
 
             # Dodaj podnapise
@@ -4106,6 +4182,8 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
                 ukaz.append(srt_pot)
 
             subprocess.run(ukaz, check=True, capture_output=True)
+            os.replace(izhodna_zacasna_pot, ciljna_pot)
+            izhodna_zacasna_pot = None
 
             # Počisti začasne datoteke
             if zacasna_pot and os.path.exists(zacasna_pot):
@@ -4122,13 +4200,16 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
                     os.remove(srt_pot)
                     print(f"  ✗ Izbrisan: {Path(srt_pot).name}")
 
-        except subprocess.CalledProcessError as e:
-            napaka = e.stderr.decode() if e.stderr else str(e)
+        except (subprocess.CalledProcessError, OSError, RuntimeError) as e:
+            stderr = getattr(e, "stderr", None)
+            napaka = stderr.decode() if isinstance(stderr, bytes) else (stderr or str(e))
             print(f"  ✗ Napaka: {napaka[:100]}")
             neuspesne += 1
             # Počisti morebitne začasne datoteke
             if zacasna_pot and os.path.exists(zacasna_pot):
                 os.remove(zacasna_pot)
+            if izhodna_zacasna_pot and os.path.exists(izhodna_zacasna_pot):
+                os.remove(izhodna_zacasna_pot)
 
     print(f"\nKončano: {uspesne} uspešnih, {neuspesne} neuspešnih")
 
