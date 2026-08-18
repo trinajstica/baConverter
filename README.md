@@ -66,6 +66,10 @@ Hiter način za obdelavo trenutnega imenika:
 - `python3 bac.py -q`  — za vsak MKV ustvari kopijo `_bac`: video ostane nespremenjen, ostane en angleški zvočni zapis (če ga ni, prvi), podnapisi pa so samo slovenski, sicer hrvaški, sicer bosanski, sicer srbski v latinici. Edini ohranjeni podnapisi so privzeti.
 - `python3 bac.py -qq` — kot zgoraj, vendar po uspehu zamenja izvorni MKV.
 
+CLI način preskoči MKV datoteke, ki so že pravilno urejene. Pri vhodnih video
+datotekah, katerih zvok ni AC3, se video in zvok pretvorita v enem prehodu
+`ffmpeg`, zato ni več vmesnega prepakiranja z `mkvmerge`.
+
 CLI poišče video datoteke (.mp4, .avi, .mov, ...) in MKV-je, poišče pripadajoče `.srt` datoteke z enakim imenom ter po potrebi pretvori izbrani zvok v AC3. Zunanji pripadajoči SRT se obravnava kot slovenski podnapis in ima prednost.
 
 ## Galerija slik 🖼️

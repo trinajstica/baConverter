@@ -4286,6 +4286,29 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
         _, indeks, jezik = min(kandidati)
         return indeks, jezik
 
+    def je_mkv_ze_pripravljen(sledi, zunanji_srt):
+        """Preveri, ali bi bila ponovna obdelava datoteke brez učinka."""
+        if zunanji_srt:
+            return False
+
+        zvoki = [sled for sled in sledi if sled.get("codec_type") == "audio"]
+        podnapisi = [sled for sled in sledi if sled.get("codec_type") == "subtitle"]
+        if len(zvoki) != 1:
+            return False
+
+        zvok = zvoki[0]
+        if zvok.get("codec_name", "").lower() != "ac3":
+            return False
+        if not zvok.get("disposition", {}).get("default", 0):
+            return False
+
+        pod_relativni, _ = izberi_podnapis(sledi)
+        if pod_relativni is None:
+            return not podnapisi
+        if len(podnapisi) != 1:
+            return False
+        return bool(podnapisi[0].get("disposition", {}).get("default", 0))
+
     def pridobi_sledi(pot):
         if not ffprobe:
             raise RuntimeError("ffprobe ni nameščen; -q ne more varno izbrati sledi.")
@@ -4340,6 +4363,19 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
             uporabi_zunanji_srt = bool(srt_pot)
             if uporabi_zunanji_srt:
                 sub_relativni, sub_jezik = None, "slv"
+
+            if je_mkv_ze_pripravljen(sledi, uporabi_zunanji_srt):
+                ciljna_pot = (
+                    mkv_pot
+                    if izbrisi_izvorne
+                    else edinstvena_bac_pot(mkv_pot)
+                )
+                if izbrisi_izvorne:
+                    print("  = že pravilno urejen; preskakujem ponovno obdelavo")
+                else:
+                    shutil.copy2(mkv_pot, ciljna_pot)
+                    print(f"  = že pravilno urejen; kopija: {Path(ciljna_pot).name}")
+                return True
 
             pretvori_audio = audio_kodek and audio_kodek.lower() != "ac3"
             ciljna_pot = mkv_pot if izbrisi_izvorne else edinstvena_bac_pot(mkv_pot)
@@ -4505,6 +4541,7 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
             zacasna_pot = None
             izhodna_zacasna_pot = None
             mkv_audio_id = None
+            neposredno_izhod = False
             if not potrebna_pretvorba_audio and izbrani_audio_id is not None:
                 mkv_audio_map = pridobi_mkvmerge_track_map(video_pot, ffprobe_sledi)
                 mkv_audio_id = mkv_audio_map.get(str(izbrani_audio_id))
@@ -4513,55 +4550,93 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
                         "Izbrane zvočne sledi ni mogoče zanesljivo najti v mkvmerge."
                     )
 
-            # Če je potrebna pretvorba zvoka
+            # Če je potrebna pretvorba zvoka, naredimo celoten izhod z enim
+            # ffmpeg prehodom. Prejšnja pot je najprej ustvarila začasni MKV,
+            # nato pa ga je še enkrat prepakiral mkvmerge.
             if potrebna_pretvorba_audio and ffmpeg:
                 print(f"  Pretvarjam zvok ({audio_kodek} → AC3)...")
-                zacasna_pot = ciljna_pot.replace(".mkv", "_temp_audio.mkv")
+                fd, izhodna_zacasna_pot = tempfile.mkstemp(
+                    prefix=f".{Path(ciljna_pot).stem}.bac-output-",
+                    suffix=".mkv",
+                    dir=video_dir,
+                )
+                os.close(fd)
+                os.remove(izhodna_zacasna_pot)
 
                 if "flatpak run" in ffmpeg:
-                    ukaz_ff = ffmpeg.split() + ["-i", video_pot, "-y"]
+                    ukaz_ff = ffmpeg.split() + ["-nostdin", "-y", "-i", video_pot]
                 else:
-                    ukaz_ff = [ffmpeg, "-i", video_pot, "-y"]
+                    ukaz_ff = [ffmpeg, "-nostdin", "-y", "-i", video_pot]
 
-                # -sn onemogoči kopiranje podnapisov iz izvorne datoteke
+                if srt_pot:
+                    ukaz_ff.extend(["-i", srt_pot])
+
                 audio_map = (
                     f"0:a:{izbrani_audio_relativni}"
                     if izbrani_audio_relativni is not None
                     else "0:a:0"
                 )
                 ukaz_ff.extend(["-map", "0:v", "-map", audio_map])
-                ukaz_ff.extend(["-c:v", "copy", "-c:a", "ac3", "-b:a", "192k", "-sn"])
-                ukaz_ff.append(zacasna_pot)
+                if srt_pot:
+                    ukaz_ff.extend(
+                        [
+                            "-map",
+                            "1:0",
+                            "-metadata:s:s:0",
+                            "language=slv",
+                            "-disposition:s:0",
+                            "default",
+                        ]
+                    )
+                ukaz_ff.extend(
+                    [
+                        "-map_metadata",
+                        "0",
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "ac3",
+                        "-b:a",
+                        "192k",
+                        "-c:s",
+                        "copy",
+                        "-disposition:a:0",
+                        "default",
+                        izhodna_zacasna_pot,
+                    ]
+                )
 
                 subprocess.run(ukaz_ff, check=True, capture_output=True)
-                vhodna_datoteka = zacasna_pot
+                os.replace(izhodna_zacasna_pot, ciljna_pot)
+                izhodna_zacasna_pot = None
+                neposredno_izhod = True
 
-            # Združi z mkvmerge
-            fd, izhodna_zacasna_pot = tempfile.mkstemp(
-                prefix=f".{Path(ciljna_pot).stem}.bac-output-",
-                suffix=".mkv",
-                dir=video_dir,
-            )
-            os.close(fd)
-            os.remove(izhodna_zacasna_pot)
-            if "flatpak run" in mkvmerge:
-                ukaz = mkvmerge.split() + ["-o", izhodna_zacasna_pot]
-            else:
-                ukaz = [mkvmerge, "-o", izhodna_zacasna_pot]
+            if not neposredno_izhod:
+                # Združi z mkvmerge, kadar zvoka ni treba pretvarjati.
+                fd, izhodna_zacasna_pot = tempfile.mkstemp(
+                    prefix=f".{Path(ciljna_pot).stem}.bac-output-",
+                    suffix=".mkv",
+                    dir=video_dir,
+                )
+                os.close(fd)
+                os.remove(izhodna_zacasna_pot)
+                if "flatpak run" in mkvmerge:
+                    ukaz = mkvmerge.split() + ["-o", izhodna_zacasna_pot]
+                else:
+                    ukaz = [mkvmerge, "-o", izhodna_zacasna_pot]
 
-            # Ohrani samo prvi audio track iz izvorne (če ni bil že pretvorjen)
-            if not potrebna_pretvorba_audio and mkv_audio_id is not None:
-                ukaz.extend(["--audio-tracks", str(mkv_audio_id)])
-            ukaz.append(vhodna_datoteka)
+                # Ohrani samo izbrano zvočno sled iz izvorne datoteke.
+                if mkv_audio_id is not None:
+                    ukaz.extend(["--audio-tracks", str(mkv_audio_id)])
+                ukaz.append(vhodna_datoteka)
 
-            # Dodaj podnapise
-            if srt_pot:
-                ukaz.extend(["--language", "0:slv", "--default-track", "0:yes"])
-                ukaz.append(srt_pot)
+                if srt_pot:
+                    ukaz.extend(["--language", "0:slv", "--default-track", "0:yes"])
+                    ukaz.append(srt_pot)
 
-            subprocess.run(ukaz, check=True, capture_output=True)
-            os.replace(izhodna_zacasna_pot, ciljna_pot)
-            izhodna_zacasna_pot = None
+                subprocess.run(ukaz, check=True, capture_output=True)
+                os.replace(izhodna_zacasna_pot, ciljna_pot)
+                izhodna_zacasna_pot = None
 
             # Počisti začasne datoteke
             if zacasna_pot and os.path.exists(zacasna_pot):
