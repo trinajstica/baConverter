@@ -10,7 +10,7 @@ Uporaba:
   bac -qq      - Kot -q, ampak zamenja izvorne datoteke po uspehu
 """
 
-verzija = "v1.0.7"
+verzija = "v1.0.10"
 
 import argparse
 import importlib
@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from tkinter import font as tkfont
 from pathlib import Path
 from types import SimpleNamespace
 from tkinter import filedialog, messagebox, ttk
@@ -112,6 +113,131 @@ def _pripravi_tkinterdnd2():
 
 class OperacijaPrekinjena(Exception):
     """Izjema za nadzorovano prekinitev operacije ob zapiranju GUI-ja."""
+
+
+class ZaobljenGumb(tk.Canvas):
+    """Lahek gumb s stabilnim 5 px zaobljenim ozadjem."""
+
+    def __init__(self, master, text, command, paleta, poudarjen=False, **kwargs):
+        kwargs.pop("style", None)
+        self._besedilo = text
+        self._ukaz = command
+        self._paleta = paleta
+        self._poudarjen = poudarjen
+        self._stanje = "normal"
+        self._pod_misko = False
+        self._pritisnjen = False
+        self._pisava = tkfont.Font(
+            root=master,
+            family="TkDefaultFont",
+            size=10,
+            weight="bold" if poudarjen else "normal",
+        )
+        sirina = max(76, self._pisava.measure(text) + 28)
+        super().__init__(
+            master,
+            width=sirina,
+            height=36,
+            background=paleta["povrsina"],
+            borderwidth=0,
+            highlightthickness=0,
+            relief="flat",
+            takefocus=True,
+            cursor="hand2",
+            **kwargs,
+        )
+        self.bind("<Configure>", lambda _dogodek: self._narisi())
+        self.bind("<Enter>", self._vstop)
+        self.bind("<Leave>", self._izstop)
+        self.bind("<ButtonPress-1>", self._pritisni)
+        self.bind("<ButtonRelease-1>", self._spusti)
+        self.bind("<Key-space>", self._tipka)
+        self.bind("<Key-Return>", self._tipka)
+        self._narisi()
+
+    def _barve_gumba(self):
+        if self._stanje == "disabled":
+            return self._paleta["ozadje_okvir"], self._paleta["besedilo_umirjeno"]
+        if self._pritisnjen or self._pod_misko:
+            return self._paleta["gumb_aktivno"], self._paleta["besedilo"]
+        return self._paleta["gumb_ozadje"], self._paleta["besedilo"]
+
+    def _narisi_obliko(self, x1, y1, x2, y2, polmer, barva):
+        self.create_rectangle(x1 + polmer, y1, x2 - polmer, y2, fill=barva, outline="")
+        self.create_rectangle(x1, y1 + polmer, x2, y2 - polmer, fill=barva, outline="")
+        self.create_oval(x1, y1, x1 + polmer * 2, y1 + polmer * 2, fill=barva, outline="")
+        self.create_oval(x2 - polmer * 2, y1, x2, y1 + polmer * 2, fill=barva, outline="")
+        self.create_oval(x1, y2 - polmer * 2, x1 + polmer * 2, y2, fill=barva, outline="")
+        self.create_oval(x2 - polmer * 2, y2 - polmer * 2, x2, y2, fill=barva, outline="")
+
+    def _narisi(self):
+        self.delete("all")
+        sirina = max(self.winfo_width(), 20)
+        visina = max(self.winfo_height(), 20)
+        ozadje, besedilo = self._barve_gumba()
+        self._narisi_obliko(1, 1, sirina - 1, visina - 1, 5, ozadje)
+        self.create_text(
+            sirina / 2,
+            visina / 2,
+            text=self._besedilo,
+            fill=besedilo,
+            font=self._pisava,
+        )
+
+    def _vstop(self, _dogodek):
+        self._pod_misko = True
+        self._narisi()
+
+    def _izstop(self, _dogodek):
+        self._pod_misko = False
+        self._pritisnjen = False
+        self._narisi()
+
+    def _pritisni(self, _dogodek):
+        if self._stanje != "disabled":
+            self.focus_set()
+            self._pritisnjen = True
+            self._narisi()
+        return "break"
+
+    def _spusti(self, _dogodek):
+        naj_izvede = self._pritisnjen and self._stanje != "disabled"
+        self._pritisnjen = False
+        self._narisi()
+        if naj_izvede and self._ukaz:
+            self._ukaz()
+        return "break"
+
+    def _tipka(self, _dogodek):
+        if self._stanje != "disabled" and self._ukaz:
+            self._ukaz()
+        return "break"
+
+    def cget(self, option):
+        if option == "state":
+            return self._stanje
+        if option == "text":
+            return self._besedilo
+        return super().cget(option)
+
+    def configure(self, cnf=None, **kwargs):
+        if cnf:
+            kwargs.update(cnf)
+        stanje = kwargs.pop("state", None)
+        besedilo = kwargs.pop("text", None)
+        ukaz = kwargs.pop("command", None)
+        if stanje is not None:
+            self._stanje = str(stanje)
+        if besedilo is not None:
+            self._besedilo = str(besedilo)
+        if ukaz is not None:
+            self._ukaz = ukaz
+        rezultat = super().configure(**kwargs) if kwargs else None
+        if stanje is not None or besedilo is not None:
+            self._narisi()
+        return rezultat
+
+    config = configure
 
 
 class BaMKV:
@@ -211,6 +337,78 @@ class BaMKV:
         # Privzeto svetla tema
         return "svetla"
 
+    def _normaliziraj_barvo(self, vrednost):
+        """Pretvori sistemsko Tk barvo v šestnajstiški zapis."""
+        if not vrednost or str(vrednost).lower() in {"none", "null"}:
+            return None
+        try:
+            rdeca, zelena, modra = self.root.winfo_rgb(str(vrednost))
+        except tk.TclError:
+            return None
+        return f"#{rdeca // 256:02x}{zelena // 256:02x}{modra // 256:02x}"
+
+    def _prilagodi_barvo(self, barva, cilj, delez):
+        """Barvo rahlo približa ciljni barvi za hover/pressed stanje."""
+        try:
+            kanali = [int(barva[i : i + 2], 16) for i in (1, 3, 5)]
+            ciljni = [int(cilj[i : i + 2], 16) for i in (1, 3, 5)]
+        except (TypeError, ValueError):
+            return barva
+        novi = [round(a + (b - a) * delez) for a, b in zip(kanali, ciljni)]
+        return "#" + "".join(f"{kanal:02x}" for kanal in novi)
+
+    def _barva_sledi_temi(self, barva, tema):
+        """Preveri, da prebrana sistemska barva ni v očitnem nasprotju s temo."""
+        try:
+            kanali = [int(barva[i : i + 2], 16) for i in (1, 3, 5)]
+        except (TypeError, ValueError):
+            return False
+        svetlost = sum(kanali) / 3
+        return svetlost < 160 if tema == "temna" else svetlost >= 160
+
+    def _preberi_sistemske_barve_gumba(self):
+        """Prebere osnovno in hover barvo gumba iz aktivne GTK teme."""
+        try:
+            import gi
+
+            gi.require_version("Gtk", "3.0")
+            from gi.repository import Gtk
+
+            preverjanje = Gtk.init_check([])
+            uspesno = preverjanje[0] if isinstance(preverjanje, tuple) else preverjanje
+            if not uspesno:
+                return None, None
+
+            gumb = Gtk.Button(label=" ")
+            kontekst = gumb.get_style_context()
+
+            def v_hex(barva):
+                if not barva or getattr(barva, "alpha", 0) < 0.05:
+                    return None
+                return "#{:02x}{:02x}{:02x}".format(
+                    round(barva.red * 255),
+                    round(barva.green * 255),
+                    round(barva.blue * 255),
+                )
+
+            return (
+                v_hex(kontekst.get_background_color(Gtk.StateFlags.NORMAL)),
+                v_hex(kontekst.get_background_color(Gtk.StateFlags.PRELIGHT)),
+            )
+        except (ImportError, ValueError, RuntimeError, AttributeError):
+            return None, None
+
+    def _ustvari_gumb(self, master, text, command=None, style=None, **kwargs):
+        """Ustvari gumb, ki je neodvisen od pravokotnega ttk rendererja."""
+        return ZaobljenGumb(
+            master,
+            text=text,
+            command=command,
+            paleta=self.barve,
+            poudarjen=style == "Accent.TButton",
+            **kwargs,
+        )
+
     def _nastavi_temo(self):
         """Nastavi barve glede na temo namizja."""
         if self.prisiljena_tema:
@@ -222,35 +420,68 @@ class BaMKV:
         # Definiraj barvne sheme
         if tema == "temna":
             self.barve = {
-                "ozadje": "#2d2d2d",
-                "ozadje_okvir": "#383838",
-                "besedilo": "#e0e0e0",
-                "poudarek": "#4a9eff",
-                "gumb_ozadje": "#404040",
-                "gumb_aktivno": "#505050",
-                "vnos_ozadje": "#353535",
-                "drevo_ozadje": "#2d2d2d",
-                "drevo_izbrano": "#4a9eff",
-                "obroba": "#1a1a1a",
-                "obroba_svetla": "#454545",
+                "ozadje": "#111827",
+                "ozadje_okvir": "#1f2937",
+                "povrsina": "#182231",
+                "besedilo": "#e5e7eb",
+                "besedilo_umirjeno": "#9ca3af",
+                "poudarek": "#6d8cff",
+                "poudarek_temno": "#4f6ed8",
+                "gumb_ozadje": "#263244",
+                "gumb_aktivno": "#334155",
+                "vnos_ozadje": "#0f172a",
+                "drevo_ozadje": "#151f2e",
+                "drevo_izbrano": "#4568d6",
+                "obroba": "#334155",
+                "obroba_svetla": "#475569",
             }
         else:
             self.barve = {
-                "ozadje": "#f5f5f5",
+                "ozadje": "#f3f6fb",
                 "ozadje_okvir": "#ffffff",
-                "besedilo": "#1a1a1a",
-                "poudarek": "#0066cc",
-                "gumb_ozadje": "#e0e0e0",
-                "gumb_aktivno": "#d0d0d0",
+                "povrsina": "#ffffff",
+                "besedilo": "#172033",
+                "besedilo_umirjeno": "#64748b",
+                "poudarek": "#2563eb",
+                "poudarek_temno": "#1d4ed8",
+                "gumb_ozadje": "#e8eef7",
+                "gumb_aktivno": "#dbe5f2",
                 "vnos_ozadje": "#ffffff",
                 "drevo_ozadje": "#ffffff",
-                "drevo_izbrano": "#0066cc",
-                "obroba": "#b0b0b0",
-                "obroba_svetla": "#d0d0d0",
+                "drevo_izbrano": "#2563eb",
+                "obroba": "#d5deeb",
+                "obroba_svetla": "#e5ebf3",
             }
 
-        # Nastavi ttk stile
+        # Pred preklopom na clam preberemo osnovno barvo gumba iz aktivne
+        # namizne Tk teme. Tako barva sledi uporabnikovim nastavitvam.
         stil = ttk.Style()
+        sistemska_barva_gumba, sistemska_aktivna_barva_gumba = (
+            self._preberi_sistemske_barve_gumba()
+        )
+        if not sistemska_barva_gumba:
+            sistemska_barva_gumba = self._normaliziraj_barvo(
+                stil.lookup("TButton", "background")
+                or self.root.option_get("background", "Button")
+            )
+        if not sistemska_aktivna_barva_gumba:
+            sistemska_aktivna_barva_gumba = self._normaliziraj_barvo(
+                stil.lookup("TButton", "background", state=("active",))
+            )
+        if (
+            not self.prisiljena_tema
+            and sistemska_barva_gumba
+            and self._barva_sledi_temi(sistemska_barva_gumba, tema)
+        ):
+            self.barve["gumb_ozadje"] = sistemska_barva_gumba
+            self.barve["gumb_aktivno"] = (
+                sistemska_aktivna_barva_gumba
+                or self._prilagodi_barvo(
+                    sistemska_barva_gumba,
+                    "#ffffff" if tema == "svetla" else "#000000",
+                    0.12,
+                )
+            )
 
         # Poskusi uporabiti clam temo kot osnovo
         try:
@@ -311,21 +542,72 @@ class BaMKV:
             darkcolor=self.barve["obroba"],
         )
 
-        stil.configure("TFrame", background=self.barve["ozadje"])
+        stil.configure("TFrame", background=self.barve["povrsina"])
+        stil.configure("Card.TFrame", background=self.barve["povrsina"])
+        stil.configure("Header.TFrame", background=self.barve["ozadje"])
+        stil.configure("Status.TFrame", background=self.barve["ozadje"])
         stil.configure(
             "TLabelframe",
-            background=self.barve["ozadje"],
+            background=self.barve["povrsina"],
             bordercolor=self.barve["obroba"],
             lightcolor=self.barve["obroba"],
             darkcolor=self.barve["obroba"],
+            relief="solid",
+            borderwidth=1,
         )
         stil.configure(
             "TLabelframe.Label",
-            background=self.barve["ozadje"],
+            background=self.barve["povrsina"],
             foreground=self.barve["besedilo"],
+            font=("TkDefaultFont", 10, "bold"),
         )
         stil.configure(
-            "TLabel", background=self.barve["ozadje"], foreground=self.barve["besedilo"]
+            "Card.TLabelframe",
+            background=self.barve["povrsina"],
+            bordercolor=self.barve["obroba"],
+            lightcolor=self.barve["obroba"],
+            darkcolor=self.barve["obroba"],
+            relief="solid",
+            borderwidth=1,
+        )
+        stil.configure(
+            "Card.TLabelframe.Label",
+            background=self.barve["povrsina"],
+            foreground=self.barve["besedilo"],
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        stil.configure(
+            "TLabel", background=self.barve["povrsina"], foreground=self.barve["besedilo"]
+        )
+        stil.configure(
+            "Title.TLabel",
+            background=self.barve["ozadje"],
+            foreground=self.barve["besedilo"],
+            font=("TkDefaultFont", 18, "bold"),
+        )
+        stil.configure(
+            "Subtitle.TLabel",
+            background=self.barve["ozadje"],
+            foreground=self.barve["besedilo_umirjeno"],
+            font=("TkDefaultFont", 10),
+        )
+        stil.configure(
+            "Section.TLabel",
+            background=self.barve["povrsina"],
+            foreground=self.barve["besedilo"],
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        stil.configure(
+            "Hint.TLabel",
+            background=self.barve["povrsina"],
+            foreground=self.barve["besedilo_umirjeno"],
+            font=("TkDefaultFont", 9),
+        )
+        stil.configure(
+            "Status.TLabel",
+            background=self.barve["ozadje"],
+            foreground=self.barve["besedilo_umirjeno"],
+            padding=(4, 3),
         )
         stil.configure(
             "Napredek.TLabel",
@@ -339,6 +621,7 @@ class BaMKV:
             bordercolor=self.barve["obroba"],
             lightcolor=self.barve["obroba_svetla"],
             darkcolor=self.barve["obroba"],
+            padding=[12, 7],
         )
         stil.map(
             "TButton",
@@ -348,12 +631,42 @@ class BaMKV:
             ],
         )
         stil.configure(
+            "Accent.TButton",
+            background=self.barve["poudarek"],
+            foreground="#ffffff",
+            bordercolor=self.barve["poudarek"],
+            lightcolor=self.barve["poudarek"],
+            darkcolor=self.barve["poudarek_temno"],
+            padding=[14, 8],
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        stil.map(
+            "Accent.TButton",
+            background=[
+                ("disabled", self.barve["gumb_ozadje"]),
+                ("active", self.barve["poudarek_temno"]),
+                ("pressed", self.barve["poudarek_temno"]),
+            ],
+            foreground=[("disabled", self.barve["besedilo_umirjeno"]), ("!disabled", "#ffffff")],
+        )
+        stil.configure(
+            "Quiet.TButton",
+            background=self.barve["povrsina"],
+            foreground=self.barve["poudarek"],
+            bordercolor=self.barve["obroba"],
+            lightcolor=self.barve["obroba"],
+            darkcolor=self.barve["obroba"],
+            padding=[12, 7],
+        )
+        stil.map("Quiet.TButton", background=[("active", self.barve["gumb_aktivno"])])
+        stil.configure(
             "TEntry",
             fieldbackground=self.barve["vnos_ozadje"],
             foreground=self.barve["besedilo"],
             bordercolor=self.barve["obroba"],
             lightcolor=self.barve["obroba"],
             darkcolor=self.barve["obroba"],
+            padding=[8, 6],
         )
         stil.configure(
             "TCombobox",
@@ -365,22 +678,22 @@ class BaMKV:
         )
         stil.configure(
             "TCheckbutton",
-            background=self.barve["ozadje"],
+            background=self.barve["povrsina"],
             foreground=self.barve["besedilo"],
         )
         stil.map(
             "TCheckbutton",
-            background=[("active", self.barve["ozadje"])],
+            background=[("active", self.barve["povrsina"])],
             foreground=[("active", self.barve["besedilo"])],
         )
         stil.configure(
             "TRadiobutton",
-            background=self.barve["ozadje"],
+            background=self.barve["povrsina"],
             foreground=self.barve["besedilo"],
         )
         stil.map(
             "TRadiobutton",
-            background=[("active", self.barve["ozadje"])],
+            background=[("active", self.barve["povrsina"])],
             foreground=[("active", self.barve["besedilo"])],
         )
         stil.configure(
@@ -389,21 +702,29 @@ class BaMKV:
             bordercolor=self.barve["obroba"],
             lightcolor=self.barve["obroba"],
             darkcolor=self.barve["obroba"],
-            tabmargins=[2, 5, 2, 0],
+            tabmargins=[0, 6, 0, 0],
+            padding=0,
         )
         stil.configure(
             "TNotebook.Tab",
             background=self.barve["gumb_ozadje"],
             foreground=self.barve["besedilo"],
-            padding=[10, 5],
+            padding=[12, 8],
             bordercolor=self.barve["obroba"],
             lightcolor=self.barve["obroba"],
             darkcolor=self.barve["obroba"],
+            focuscolor=self.barve["obroba"],
         )
         stil.map(
             "TNotebook.Tab",
-            background=[("selected", self.barve["ozadje_okvir"])],
-            foreground=[("selected", self.barve["besedilo"])],
+            background=[
+                ("selected", self.barve["gumb_aktivno"]),
+                ("active", self.barve["gumb_aktivno"]),
+            ],
+            foreground=[
+                ("selected", self.barve["besedilo"]),
+                ("active", self.barve["besedilo"]),
+            ],
             lightcolor=[("selected", self.barve["obroba"])],
             darkcolor=[("selected", self.barve["obroba"])],
             bordercolor=[("selected", self.barve["obroba"])],
@@ -416,12 +737,18 @@ class BaMKV:
             foreground=self.barve["besedilo"],
             fieldbackground=self.barve["drevo_ozadje"],
             bordercolor=self.barve["obroba"],
+            borderwidth=0,
+            relief="flat",
+            rowheight=30,
         )
         stil.configure(
             "Treeview.Heading",
-            background=self.barve["gumb_ozadje"],
+            background=self.barve["ozadje_okvir"],
             foreground=self.barve["besedilo"],
             bordercolor=self.barve["obroba"],
+            relief="flat",
+            padding=[10, 8],
+            font=("TkDefaultFont", 9, "bold"),
         )
         stil.map(
             "Treeview.Heading",
@@ -1149,7 +1476,7 @@ class BaMKV:
             )
             dialog.destroy()
 
-        ttk.Button(dialog, text="Potrdi", command=potrdi).pack(pady=10)
+        self._ustvari_gumb(dialog, text="Potrdi", command=potrdi).pack(pady=10)
 
     def _nastavi_zasedeno(self, sporocilo):
         """Nastavi aplikacijo v zaseden način s sporočilom."""
@@ -1538,23 +1865,47 @@ class BaMKV:
 
     def _ustvari_vmesnik(self):
         """Ustvari glavni vmesnik."""
-        # Okvir za izbiro datoteke
-        self.okvir_datoteka = ttk.LabelFrame(
-            self.root, text="MKV datoteka", padding=10
-        )
-        self.okvir_datoteka.pack(fill="x", padx=10, pady=5)
+        # Glava aplikacije
+        okvir_glava = ttk.Frame(self.root, style="Header.TFrame")
+        okvir_glava.pack(fill="x", padx=18, pady=(14, 8))
+        ttk.Label(okvir_glava, text="baC", style="Title.TLabel").pack(side="left")
+        ttk.Label(
+            okvir_glava,
+            text="  urejanje in združevanje MKV datotek",
+            style="Subtitle.TLabel",
+        ).pack(side="left", pady=(6, 0))
 
-        self.vnos_pot = ttk.Entry(self.okvir_datoteka, width=70)
+        # Zgornja kartica za izbiro datoteke
+        self.okvir_datoteka = ttk.Frame(self.root, style="Card.TFrame", padding=12)
+        self.okvir_datoteka.pack(fill="x", padx=18, pady=(0, 8))
+
+        okvir_napis = ttk.Frame(self.okvir_datoteka, style="Card.TFrame")
+        okvir_napis.pack(fill="x", pady=(0, 8))
+        ttk.Label(
+            okvir_napis, text="Vhodna MKV datoteka", style="Section.TLabel"
+        ).pack(side="left")
+        ttk.Label(
+            okvir_napis,
+            text="Izberite datoteko ali jo povlecite v okno",
+            style="Hint.TLabel",
+        ).pack(side="right")
+
+        okvir_vnos = ttk.Frame(self.okvir_datoteka, style="Card.TFrame")
+        okvir_vnos.pack(fill="x")
+        self.vnos_pot = ttk.Entry(okvir_vnos, width=70)
         self.vnos_pot.pack(side="left", fill="x", expand=True, padx=(0, 10))
 
-        self.gumb_odpri_mkv = ttk.Button(
-            self.okvir_datoteka, text="Odpri MKV", command=self._odpri_mkv
+        self.gumb_odpri_mkv = self._ustvari_gumb(
+            okvir_vnos,
+            text="Odpri MKV",
+            command=self._odpri_mkv,
+            style="Accent.TButton",
         )
         self.gumb_odpri_mkv.pack(side="left")
 
         # Zavihki
         self.zavihki = ttk.Notebook(self.root)
-        self.zavihki.pack(fill="both", expand=True, padx=10, pady=5)
+        self.zavihki.pack(fill="both", expand=True, padx=18, pady=(0, 8))
 
         # Zavihek: Pregled sledi
         self.zavihek_pregled = ttk.Frame(self.zavihki, padding=10)
@@ -1592,11 +1943,14 @@ class BaMKV:
         self._ustvari_navodila(okvir_navodila)
 
         # Statusna vrstica
-        okvir_status = ttk.Frame(self.root)
-        okvir_status.pack(fill="x", padx=10, pady=5)
+        okvir_status = ttk.Frame(self.root, style="Status.TFrame")
+        okvir_status.pack(fill="x", padx=18, pady=(0, 12))
 
         self.status = ttk.Label(
-            okvir_status, text="Pripravljeno", relief="sunken", anchor="w"
+            okvir_status,
+            text="Pripravljeno",
+            style="Status.TLabel",
+            anchor="w",
         )
         self.status.pack(side="left", fill="x", expand=True)
 
@@ -1682,16 +2036,16 @@ class BaMKV:
         okvir_dodaj = ttk.Frame(okvir_sledi)
         okvir_dodaj.pack(fill="x", pady=5)
 
-        ttk.Button(
+        self._ustvari_gumb(
             okvir_dodaj,
             text="Osveži",
             command=lambda: self._osvezi_sledi(prisilno=True),
         ).pack(side="left", padx=2)
-        self.gumb_podnapisi = ttk.Button(
+        self.gumb_podnapisi = self._ustvari_gumb(
             okvir_dodaj, text="+ Podnapisi", command=self._op_dodaj_podnapise
         )
         self.gumb_podnapisi.pack(side="left", padx=2)
-        self.gumb_zvok = ttk.Button(
+        self.gumb_zvok = self._ustvari_gumb(
             okvir_dodaj, text="+ Zvok", command=self._op_dodaj_zvok
         )
         self.gumb_zvok.pack(side="left", padx=2)
@@ -1721,10 +2075,10 @@ class BaMKV:
         okvir_gumbi = ttk.Frame(okvir_operacije)
         okvir_gumbi.pack(fill="x", pady=5)
 
-        ttk.Button(
+        self._ustvari_gumb(
             okvir_gumbi, text="Odstrani izbrano", command=self._odstrani_operacijo
         ).pack(side="left", padx=2)
-        ttk.Button(
+        self._ustvari_gumb(
             okvir_gumbi, text="Počisti vse", command=self._pocisti_operacije
         ).pack(side="left", padx=2)
 
@@ -1744,8 +2098,11 @@ class BaMKV:
         )
         self.napredek_operacij.pack(fill="x", pady=(3, 0))
 
-        self.gumb_izvedi = ttk.Button(
-            okvir_gumbi, text="▶ Izvedi vse", command=self._izvedi_operacije
+        self.gumb_izvedi = self._ustvari_gumb(
+            okvir_gumbi,
+            text="▶ Izvedi vse",
+            command=self._izvedi_operacije,
+            style="Accent.TButton",
         )
         self.gumb_izvedi.pack(side="right", padx=2, ipadx=10)
 
@@ -1859,7 +2216,7 @@ class BaMKV:
             )
             dialog.destroy()
 
-        ttk.Button(dialog, text="Potrdi", command=potrdi).pack(pady=10)
+        self._ustvari_gumb(dialog, text="Potrdi", command=potrdi).pack(pady=10)
 
     def _op_spremeni_naslov(self):
         """Doda operacijo za spremembo naslova."""
@@ -1883,7 +2240,7 @@ class BaMKV:
             )
             dialog.destroy()
 
-        ttk.Button(dialog, text="Potrdi", command=potrdi).pack(pady=10)
+        self._ustvari_gumb(dialog, text="Potrdi", command=potrdi).pack(pady=10)
 
     def _op_nastavi_privzeto(self):
         """Doda operacijo za nastavitev privzete sledi."""
@@ -2250,7 +2607,7 @@ class BaMKV:
         self.vnos_podnapis = ttk.Entry(okvir_podnapis, width=60)
         self.vnos_podnapis.pack(side="left", fill="x", expand=True, padx=(0, 10))
 
-        ttk.Button(okvir_podnapis, text="Izberi", command=self._izberi_podnapis).pack(
+        self._ustvari_gumb(okvir_podnapis, text="Izberi", command=self._izberi_podnapis).pack(
             side="left"
         )
 
@@ -2296,7 +2653,12 @@ class BaMKV:
             variable=self.zamenjaj_podnapise,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=5)
 
-        ttk.Button(okvir, text="Dodaj podnapise", command=self._dodaj_podnapise).pack(
+        self._ustvari_gumb(
+            okvir,
+            text="Dodaj podnapise",
+            command=self._dodaj_podnapise,
+            style="Accent.TButton",
+        ).pack(
             pady=20
         )
 
@@ -2358,7 +2720,12 @@ class BaMKV:
         self.video_crf.set("23 (srednja)")
         self.video_crf.grid(row=1, column=1, sticky="w", padx=10, pady=5)
 
-        ttk.Button(okvir, text="Pretvori in shrani", command=self._pretvori).pack(
+        self._ustvari_gumb(
+            okvir,
+            text="Pretvori in shrani",
+            command=self._pretvori,
+            style="Accent.TButton",
+        ).pack(
             pady=20
         )
 
@@ -2388,11 +2755,14 @@ class BaMKV:
         okvir_gumbi = ttk.Frame(okvir)
         okvir_gumbi.pack(fill="x", pady=10)
 
-        ttk.Button(
+        self._ustvari_gumb(
             okvir_gumbi, text="Osveži seznam", command=self._osvezi_odstranitev
         ).pack(side="left", padx=5)
-        ttk.Button(
-            okvir_gumbi, text="Odstrani označene sledi", command=self._odstrani_sledi
+        self._ustvari_gumb(
+            okvir_gumbi,
+            text="Odstrani označene sledi",
+            command=self._odstrani_sledi,
+            style="Accent.TButton",
         ).pack(side="left", padx=5)
 
     def _ustvari_izdelavo(self, okvir):
@@ -2428,21 +2798,21 @@ class BaMKV:
         okvir_dodaj = ttk.Frame(okvir)
         okvir_dodaj.pack(fill="x", pady=5)
 
-        ttk.Button(
+        self._ustvari_gumb(
             okvir_dodaj, text="Dodaj video", command=lambda: self._dodaj_vhodno("video")
         ).pack(side="left", padx=5)
-        ttk.Button(
+        self._ustvari_gumb(
             okvir_dodaj, text="Dodaj zvok", command=lambda: self._dodaj_vhodno("audio")
         ).pack(side="left", padx=5)
-        ttk.Button(
+        self._ustvari_gumb(
             okvir_dodaj,
             text="Dodaj podnapise",
             command=lambda: self._dodaj_vhodno("podnapisi"),
         ).pack(side="left", padx=5)
-        ttk.Button(
+        self._ustvari_gumb(
             okvir_dodaj, text="Odstrani izbrano", command=self._odstrani_vhodno
         ).pack(side="left", padx=5)
-        ttk.Button(okvir_dodaj, text="Počisti vse", command=self._pocisti_vhodne).pack(
+        self._ustvari_gumb(okvir_dodaj, text="Počisti vse", command=self._pocisti_vhodne).pack(
             side="left", padx=5
         )
 
@@ -2463,7 +2833,12 @@ class BaMKV:
             variable=self.kopiraj_metapodatke,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=5)
 
-        ttk.Button(okvir, text="Ustvari MKV", command=self._ustvari_mkv).pack(pady=15)
+        self._ustvari_gumb(
+            okvir,
+            text="Ustvari MKV",
+            command=self._ustvari_mkv,
+            style="Accent.TButton",
+        ).pack(pady=15)
 
     def _dodaj_vhodno(self, vrsta):
         """Dodaj vhodno datoteko za izdelavo MKV."""
@@ -2538,7 +2913,7 @@ class BaMKV:
             rezultat[0] = izbira.get().split(" - ")[0]
             dialog.destroy()
 
-        ttk.Button(dialog, text="Potrdi", command=potrdi).pack(pady=10)
+        self._ustvari_gumb(dialog, text="Potrdi", command=potrdi).pack(pady=10)
 
         dialog.wait_window()
         return rezultat[0]
@@ -2857,7 +3232,7 @@ class BaMKV:
         self.vnos_hitro_video = ttk.Entry(okvir_video, width=60)
         self.vnos_hitro_video.pack(side="left", fill="x", expand=True, padx=(0, 10))
 
-        ttk.Button(okvir_video, text="Izberi", command=self._izberi_hitro_video).pack(
+        self._ustvari_gumb(okvir_video, text="Izberi", command=self._izberi_hitro_video).pack(
             side="left"
         )
 
@@ -2943,8 +3318,11 @@ class BaMKV:
         okvir_gumb = ttk.Frame(okvir)
         okvir_gumb.pack(fill="x", pady=10)
 
-        gumb_pretvori = ttk.Button(
-            okvir_gumb, text="▶ Pretvori v MKV", command=self._izvedi_hitro_pretvorbo
+        gumb_pretvori = self._ustvari_gumb(
+            okvir_gumb,
+            text="▶ Pretvori v MKV",
+            command=self._izvedi_hitro_pretvorbo,
+            style="Accent.TButton",
         )
         gumb_pretvori.pack(pady=5, ipadx=20, ipady=5)
 
