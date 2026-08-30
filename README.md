@@ -70,7 +70,29 @@ CLI način preskoči MKV datoteke, ki so že pravilno urejene. Pri vhodnih video
 datotekah, katerih zvok ni AC3, se video in zvok pretvorita v enem prehodu
 `ffmpeg`, zato ni več vmesnega prepakiranja z `mkvmerge`.
 
-CLI poišče video datoteke (.mp4, .avi, .mov, ...) in MKV-je, poišče pripadajoče `.srt` datoteke z enakim imenom ter po potrebi pretvori izbrani zvok v AC3. Zunanji pripadajoči SRT se obravnava kot slovenski podnapis in ima prednost.
+#### Pravila za podnapise in zvok
+
+Za datoteko `film.mkv` baC preveri samo natančno poimenovano zunanjo datoteko
+`film.srt` v isti mapi.
+
+- Če `film.srt` obstaja, ima vedno prednost pred vsemi notranjimi podnapisi,
+  ne glede na njihove jezikovne oznake. Zunanji SRT se združi z MKV kot edini
+  podnapis, vsi notranji podnapisi pa se odstranijo. Pri `-qq` se uporabljeni
+  zunanji `film.srt` po uspešni obdelavi izbriše.
+- Datoteke z drugačnimi priponami ali dodatnimi oznakami, na primer
+  `film.sl.srt`, `film.en.srt` ali `film.forced.srt`, se ne obravnavajo kot
+  zunanji SRT za ta namen.
+- Če `film.srt` ne obstaja, se notranji podnapisi obdelajo po običajnih
+  pravilih: prednost ima `slv`/`sl`, nato `hrv`/`hr`, nato `bos`/`bs`, nato
+  srbski podnapis, označen kot latinica. Izbran ostane samo najbolj prednostni
+  podnapis in je nastavljen kot privzet. Če ustreznega podnapisa ni, se vsi
+  notranji podnapisi odstranijo.
+- Ne glede na zunanji SRT se preveri tudi zvok: izbere se angleška zvočna sled,
+  če obstaja, sicer prva. Če ni v formatu AC3, se pretvori v AC3 in nastavi kot
+  privzeta zvočna sled.
+
+Pri `-q` se ustvari kopija z dodatkom `_bac`, pri `-qq` pa se po uspešni
+obdelavi zamenja izvorni MKV.
 
 ## Galerija slik 🖼️
 
