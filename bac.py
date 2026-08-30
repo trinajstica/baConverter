@@ -4436,25 +4436,10 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
         osnovni_ime = Path(mkv_pot).stem
         video_dir = os.path.dirname(mkv_pot)
 
-        # Poišči pripadajoči SRT v isti mapi
-        srt_pot = None
-        for koncnica in [".srt", ".sl.srt", ".slv.srt", "_sl.srt", "_slv.srt"]:
-            mozna_pot = os.path.join(video_dir, f"{osnovni_ime}{koncnica}")
-            if os.path.exists(mozna_pot):
-                srt_pot = mozna_pot
-                break
-
-        if not srt_pot:
-            for datoteka in os.listdir(video_dir):
-                if datoteka.lower().endswith(".srt"):
-                    dat_stem = Path(datoteka).stem
-                    if (
-                        dat_stem == osnovni_ime
-                        or dat_stem.startswith(osnovni_ime + ".")
-                        or dat_stem.startswith(osnovni_ime + "_")
-                    ):
-                        srt_pot = os.path.join(video_dir, datoteka)
-                        break
+        # Zunanji SRT uporabimo samo, če ima popolnoma enako osnovno ime kot MKV.
+        # Če ga ni, notranji podnapisi ostanejo obravnavani po pravilih za -q.
+        tocno_srt = os.path.join(video_dir, f"{osnovni_ime}.srt")
+        srt_pot = tocno_srt if os.path.isfile(tocno_srt) else None
 
         if obdelaj_mkv_po_pravilih(mkv_pot, srt_pot, izbrisi_izvorne):
             uspesne += 1
@@ -4470,26 +4455,9 @@ def hitro_pretvorba_cli(izbrisi_izvorne=False):
         if os.path.exists(ciljna_pot):
             continue
 
-        # Poišči pripadajoči SRT v isti mapi
-        srt_pot = None
-        for koncnica in [".srt", ".sl.srt", ".slv.srt", "_sl.srt", "_slv.srt"]:
-            mozna_pot = os.path.join(video_dir, f"{osnovni_ime}{koncnica}")
-            if os.path.exists(mozna_pot):
-                srt_pot = mozna_pot
-                break
-
-        # Poskusi najti SRT z enakim začetkom imena
-        if not srt_pot:
-            for datoteka in os.listdir(video_dir):
-                if datoteka.lower().endswith(".srt"):
-                    dat_stem = Path(datoteka).stem
-                    if (
-                        dat_stem == osnovni_ime
-                        or dat_stem.startswith(osnovni_ime + ".")
-                        or dat_stem.startswith(osnovni_ime + "_")
-                    ):
-                        srt_pot = os.path.join(video_dir, datoteka)
-                        break
+        # Zunanji SRT uporabimo samo, če ima popolnoma enako osnovno ime kot video.
+        tocno_srt = os.path.join(video_dir, f"{osnovni_ime}.srt")
+        srt_pot = tocno_srt if os.path.isfile(tocno_srt) else None
 
         print(f"Pretvarjam: {Path(video_pot).name}")
         if srt_pot:
